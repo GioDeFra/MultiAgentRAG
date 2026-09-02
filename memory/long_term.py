@@ -1,32 +1,22 @@
 """
 memory/long_term.py — Long-term (cross-session) persistent memory.
 
-Stores two things in ChromaDB (on disk, survives restarts):
+Stores concise summaries of retrieval-grounded Q&A in ChromaDB (on disk,
+survives restarts).
 
-1. Past Q&A pairs
-   Embedded and indexed so the supervisor can find semantically
-   similar questions that were already answered. If a good match
-   is found, the past answer is injected as extra context —
-   avoiding redundant retrieval and improving consistency.
+Past Q&A pairs are embedded and indexed so the supervisor can find
+semantically similar questions that were already answered. If a good match
+is found, the past summary is injected as supporting background to improve
+continuity and consistency. It does NOT replace the normal Pinecone
+retrieval: current retrieved documents remain the authoritative sources.
 
-   The stored "answer" is an LLM-written summary (concise, preserves
-   figures/article numbers) rather than a raw mid-sentence truncation.
-   If summarization fails for any reason, a word-boundary truncation
-   is used as a safe fallback — never a mid-word cut.
-
-2. Extracted facts
-   Short atomic statements extracted from each answer by the LLM
-   (e.g. "In Italy the forced heirship share for one child is 1/2
-   of the estate"). Retrieved as background knowledge to enrich
-   future answers on related topics.
-
-Summary and facts are produced in a SINGLE LLM call (not two), to
-avoid doubling latency/cost per store().
+The stored "answer" is an LLM-written summary (concise, preserving
+figures/article numbers) rather than the full response. If summarization
+fails, a word-boundary truncation is used as a safe fallback.
 """
 
 import json
 import logging
-import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -52,8 +42,9 @@ logger = logging.getLogger(__name__)
 # COLLECTION NAMES
 # ---------------------------------------------------------------------------
 
-QA_COLLECTION   = "ltm_qa_pairs"
-FACT_COLLECTION = "ltm_facts"
+QA_COLLECTION = "ltm_qa_pairs"
+LEGACY_FACT_COLLECTION = "ltm_facts"
+DEFAULT_MAX_QA_PAIRS = 150
 
 # Hard ceiling only used as a fallback if LLM summarization fails.
 # Never used to cut a sentence in half — see _truncate().
@@ -66,14 +57,14 @@ ANSWER_FALLBACK_MAX_CHARS = 2000
 
 class LongTermMemory:
     """
-    Persistent semantic memory backed by two ChromaDB collections.
+    Persistent semantic memory backed by one ChromaDB collection.
 
     Parameters
     ----------
     db_dir : str
         Path to the ChromaDB folder. Separate concern from the RAG
         document corpus, which lives in Pinecone (see agents.py) — this
-        is only for cross-session Q&A/fact memory.
+        is only for cross-session Q&A summary memory.
     embedding_model : str
         SentenceTransformer model name. Deliberately independent from the
         RAG corpus's embedding model (currently BGE-M3, see agents.py
@@ -87,10 +78,6 @@ class LongTermMemory:
     qa_similarity_threshold : float
         Cosine distance below which a past Q&A is considered a match.
         Lower = stricter. 0.25 works well for legal questions.
-    fact_similarity_threshold : float
-        Cosine distance below which a fact is considered relevant.
-        Looser than qa_similarity_threshold since facts are atomic
-        and meant to be recalled from many different angles.
     dedup_similarity_threshold : float
         Cosine distance below which an incoming question is treated as
         "the same question" as one already stored, and updated in place
@@ -102,9 +89,8 @@ class LongTermMemory:
     ChromaDB's PersistentClient is not guaranteed safe for concurrent
     reads/writes across threads. Since store() can be called from a
     background thread (e.g. supervisor answers the user immediately and
-    persists to LTM afterwards) while another call to recall_similar()/
-    recall_facts() may be in flight on the main thread, all collection
-    access is serialized behind a single lock.
+    persists to LTM afterwards) while recall_similar() may be in flight on
+    the main thread, all collection access is serialized behind one lock.
     """
 
     def __init__(
@@ -112,33 +98,40 @@ class LongTermMemory:
         db_dir: str = "./chroma_db",
         embedding_model: str = "all-mpnet-base-v2",
         qa_similarity_threshold: float = 0.25,
-        fact_similarity_threshold: float = 0.40,
         dedup_similarity_threshold: float = 0.05,
+        max_qa_pairs: int = DEFAULT_MAX_QA_PAIRS,
     ) -> None:
+        if max_qa_pairs < 1:
+            raise ValueError("max_qa_pairs must be at least 1")
+
         self.qa_threshold = qa_similarity_threshold
-        self.fact_threshold = fact_similarity_threshold
         self.dedup_threshold = dedup_similarity_threshold
+        self.max_qa_pairs = max_qa_pairs
         self._llm = get_llm_client()
         self._light_model = model_names()["light"]
 
-        # Guards all reads/writes to _qa_col and _fact_col. The LLM calls
-        # (summary/facts extraction) happen OUTSIDE this lock — they're slow
-        # network calls that don't touch the DB, so there's no reason to
-        # block other readers/writers while waiting on them.
+        # Guards all reads/writes to _qa_col. The slow LLM summary call happens
+        # OUTSIDE this lock because it does not touch the database.
         self._db_lock = threading.Lock()
 
         client = chromadb.PersistentClient(path=db_dir)
+
+        # One-time cleanup of the facts collection used by older versions.
+        # Facts were written but never consumed by the answer pipeline.
+        collection_names = {
+            c.name if hasattr(c, "name") else str(c)
+            for c in client.list_collections()
+        }
+        if LEGACY_FACT_COLLECTION in collection_names:
+            client.delete_collection(name=LEGACY_FACT_COLLECTION)
+            logger.info("Deleted unused legacy collection %s", LEGACY_FACT_COLLECTION)
+
         embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name=embedding_model
         )
 
         self._qa_col = client.get_or_create_collection(
             name=QA_COLLECTION,
-            embedding_function=embedding_fn,
-            metadata={"hnsw:space": "cosine"},
-        )
-        self._fact_col = client.get_or_create_collection(
-            name=FACT_COLLECTION,
             embedding_function=embedding_fn,
             metadata={"hnsw:space": "cosine"},
         )
@@ -150,26 +143,34 @@ class LongTermMemory:
         query: str,
         answer: str,
         agents_used: List[str],
+        countries_used: Optional[List[str]] = None,
     ) -> None:
         """
-        Save a Q&A pair (as an LLM summary) and its extracted atomic facts.
+        Save a Q&A pair using an LLM summary of the answer.
         Called at the end of every successful supervisor.ask() call.
 
         Dedup behaviour: if a near-identical question already exists
         (distance <= dedup_similarity_threshold), that record is UPDATED
-        in place (same qa_id, new answer/facts) instead of creating a new
+        in place (same qa_id, new answer) instead of creating a new
         one — avoids the QA collection filling up with many entries for
-        essentially the same question asked with different wording.
+        essentially the same question asked with different wording. Duplicate
+        detection is scoped to the same agent set, so equal questions handled
+        by different jurisdictions cannot overwrite one another.
         """
+        clean_answer = self._strip_guardrail_notice(answer)
+        countries_used = sorted(set(countries_used or []))
+        country_scope = "|".join(countries_used) or "not specified"
+
         # Summarization is a slow network call — do it BEFORE taking the
         # lock so other threads aren't blocked waiting on the LLM API.
-        summary, facts = self._summarize_and_extract(answer)
+        summary = self._summarize(clean_answer, countries_used)
         stored_answer = summary if summary is not None else self._truncate(
-            answer, ANSWER_FALLBACK_MAX_CHARS
+            clean_answer, ANSWER_FALLBACK_MAX_CHARS
         )
+        agent_scope = self._agent_scope(agents_used)
 
         with self._db_lock:
-            existing_qa_id = self._find_duplicate_locked(query)
+            existing_qa_id = self._find_duplicate_locked(query, agent_scope)
             qa_id = existing_qa_id or uuid.uuid4().hex
 
             # ChromaDB's `where` filter only matches flat scalar metadata
@@ -189,6 +190,9 @@ class LongTermMemory:
                     "answer": stored_answer,
                     "answer_is_summary": summary is not None,
                     "agents_used": json.dumps(agents_used),
+                    "agent_scope": agent_scope,
+                    "countries_used": json.dumps(countries_used),
+                    "country_scope": country_scope,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     **agent_flags,
                 }],
@@ -196,15 +200,16 @@ class LongTermMemory:
 
             if existing_qa_id:
                 logger.info("Updated existing QA record qa_id=%s (near-duplicate question)", qa_id)
-                # Drop the old facts tied to this qa_id — they belonged to
-                # the previous answer and would otherwise linger stale
-                # alongside the new ones.
-                self._delete_facts_for_qa_locked(qa_id)
+            self._enforce_retention_locked(protected_qa_id=qa_id)
 
-            if facts:
-                self._store_facts_locked(facts, qa_id)
+    @staticmethod
+    def _agent_scope(agents_used: List[str]) -> str:
+        """Stable metadata key representing the exact set of agents used."""
+        return "|".join(sorted(set(agents_used)))
 
-    def _find_duplicate_locked(self, query: str) -> Optional[str]:
+    def _find_duplicate_locked(
+        self, query: str, agent_scope: str
+    ) -> Optional[str]:
         """
         Return the qa_id of an existing near-identical question, or None.
         Caller must hold self._db_lock.
@@ -215,6 +220,7 @@ class LongTermMemory:
         results = self._qa_col.query(
             query_texts=[query],
             n_results=1,
+            where={"agent_scope": agent_scope},
             include=["distances"],
         )
         ids = results.get("ids", [[]])[0]
@@ -223,21 +229,27 @@ class LongTermMemory:
             return ids[0]
         return None
 
-    def _delete_facts_for_qa_locked(self, qa_id: str) -> None:
-        """Delete all facts previously linked to this qa_id. Caller must hold self._db_lock."""
-        try:
-            existing = self._fact_col.get(where={"qa_id": qa_id}, include=[])
-            stale_ids = existing.get("ids", [])
-            if stale_ids:
-                self._fact_col.delete(ids=stale_ids)
-        except Exception as e:
-            logger.warning("Failed to clear stale facts for qa_id=%s: %s", qa_id, e)
+    def _enforce_retention_locked(self, protected_qa_id: str) -> None:
+        """Delete oldest Q&A one at a time until the configured cap is met."""
+        while self._qa_col.count() > self.max_qa_pairs:
+            records = self._qa_col.get(include=["metadatas"])
+            candidates = [
+                (qa_id, metadata.get("timestamp", ""))
+                for qa_id, metadata in zip(records["ids"], records["metadatas"])
+                if qa_id != protected_qa_id
+            ]
+            if not candidates:
+                return
+
+            oldest_qa_id, _ = min(candidates, key=lambda item: item[1])
+            self._qa_col.delete(ids=[oldest_qa_id])
+            logger.info("Deleted oldest LTM Q&A record qa_id=%s", oldest_qa_id)
 
     # ── Recall similar past Q&A ──────────────────────────────────────────────
 
     def recall_similar(
         self, query: str, n: int = 2, agent_id: Optional[str] = None
-    ) -> List[Tuple[str, str, float]]:
+    ) -> List[Tuple[str, str, float, str]]:
         """
         Find past Q&A pairs semantically similar to the current query.
 
@@ -258,7 +270,7 @@ class LongTermMemory:
 
         Returns
         -------
-        List of (past_question, past_answer, distance) tuples,
+        List of (past_question, past_answer, distance, country_scope) tuples,
         only those within qa_similarity_threshold.
         Empty list if nothing relevant found.
         """
@@ -285,50 +297,26 @@ class LongTermMemory:
             results["distances"][0],
         ):
             if dist <= self.qa_threshold:
-                hits.append((doc, meta["answer"], dist))
+                hits.append((
+                    doc,
+                    meta["answer"],
+                    dist,
+                    meta.get("country_scope", "not specified"),
+                ))
 
         return hits
 
-    # ── Recall relevant facts ────────────────────────────────────────────────
+    # ── Summary generation ──────────────────────────────────────────────────
 
-    def recall_facts(self, query: str, n: int = 4) -> List[str]:
+    def _summarize(
+        self, answer: str, countries_used: List[str]
+    ) -> Optional[str]:
         """
-        Return the most relevant stored facts for the current query.
-        Uses a slightly looser threshold than Q&A recall.
+        Ask the LLM for a concise summary of the complete answer, preserving
+        figures, fractions, article numbers, and named laws. Returns None on
+        failure so the caller can fall back to safe truncation.
         """
-        with self._db_lock:
-            if self._fact_col.count() == 0:
-                return []
-
-            results = self._fact_col.query(
-                query_texts=[query],
-                n_results=min(n, self._fact_col.count()),
-                include=["documents", "distances"],
-            )
-
-        return [
-            doc
-            for doc, dist in zip(
-                results["documents"][0],
-                results["distances"][0],
-            )
-            if dist <= self.fact_threshold
-        ]
-
-    # ── Summary + fact extraction (single LLM call) ─────────────────────────
-
-    def _summarize_and_extract(
-        self, answer: str
-    ) -> Tuple[Optional[str], List[str]]:
-        """
-        Ask the LLM, in one call, to:
-          1. Write a concise summary of the answer (preserving figures,
-             fractions, article numbers, named laws).
-          2. Extract 2-5 atomic, context-free facts.
-
-        Returns (summary, facts). On any failure returns (None, []) so
-        callers can fall back to truncation without crashing.
-        """
+        jurisdictions = ", ".join(countries_used) or "not specified"
         try:
             # thinking=False: cheap high-volume summarization, not worth the
             # extra latency of a reasoning pass.
@@ -340,70 +328,42 @@ class LongTermMemory:
                 messages=[{
                     "role": "user",
                     "content": (
-                        "You will receive a legal answer. Do two things:\n"
-                        "1. Write a concise summary (max ~80 words) that preserves "
+                        "Summarize the following legal answer in at most about "
+                        "80 words. Preserve "
                         "every specific figure, fraction, article number, or named "
-                        "law mentioned in the text.\n"
-                        "2. Extract 2 to 5 short, self-contained atomic facts. Each "
-                        "fact must be one sentence understandable with no other "
-                        "context.\n\n"
-                        "Return ONLY a JSON object, no other text, no markdown "
-                        "fences:\n"
-                        '{"summary": "...", "facts": ["fact 1", "fact 2"]}\n\n'
-                        f"Text:\n{answer[:3000]}"
+                        "law needed to understand the result. Return only the "
+                        "summary, with no JSON, heading, or preamble. Make the "
+                        "applicable jurisdiction explicit in the summary.\n\n"
+                        f"Jurisdiction(s): {jurisdictions}\n\n"
+                        f"Text:\n{answer}"
                     ),
                 }],
             )
-
-            raw = self._strip_fences(response.choices[0].message.content)
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if not match:
-                raise ValueError("no JSON object found in model output")
-
-            data = json.loads(match.group(0))
-
-            summary = data.get("summary")
-            summary = (
-                summary.strip()
-                if isinstance(summary, str) and summary.strip()
-                else None
-            )
-
-            raw_facts = data.get("facts", [])
-            facts = [
-                f.strip() for f in raw_facts if isinstance(f, str) and f.strip()
-            ]
-
-            return summary, facts
+            summary = response.choices[0].message.content.strip()
+            return summary or None
 
         except Exception as e:
             logger.warning(
-                "Summary/fact extraction failed, falling back to truncation: %s",
+                "Summary generation failed, falling back to truncation: %s",
                 e,
             )
-            return None, []
+            return None
 
     @staticmethod
-    def _strip_fences(raw: str) -> str:
-        """Remove markdown code fences if the model added them."""
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.lower().startswith("json"):
-                raw = raw[4:]
-        return raw.strip()
-
-    def _store_facts_locked(self, facts: List[str], qa_id: str) -> None:
-        """Caller must hold self._db_lock."""
-        self._fact_col.upsert(
-            ids=[uuid.uuid4().hex for _ in facts],
-            documents=facts,
-            metadatas=[{
-                "qa_id": qa_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            } for _ in facts],
+    def _strip_guardrail_notice(answer: str) -> str:
+        """Remove a leading technical guardrail notice before memorization."""
+        guardrail_prefixes = (
+            "[NOTE: the guardrail",
+            "[NOTE: the grounding check",
+            "[WARNING: possible citation issue",
+            "[WARNING: the guardrail",
+            "[WARNING: no source documents",
         )
-        logger.info("Stored %d facts for qa_id=%s", len(facts), qa_id)
+        if answer.startswith(guardrail_prefixes):
+            _notice, separator, clean_answer = answer.partition("\n\n")
+            if separator and clean_answer.strip():
+                return clean_answer.strip()
+        return answer
 
     # ── Fallback truncation (word-boundary, never mid-word) ─────────────────
 
@@ -418,11 +378,8 @@ class LongTermMemory:
 
     def stats(self) -> Dict[str, int]:
         with self._db_lock:
-            return {
-                "qa_pairs": self._qa_col.count(),
-                "facts":    self._fact_col.count(),
-            }
+            return {"qa_pairs": self._qa_col.count()}
 
     def __repr__(self) -> str:
         s = self.stats()
-        return f"LongTermMemory(qa={s['qa_pairs']}, facts={s['facts']})"
+        return f"LongTermMemory(qa={s['qa_pairs']}/{self.max_qa_pairs})"

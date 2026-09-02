@@ -1,13 +1,11 @@
 """
 memory/chat_history.py — Full-fidelity chat session history.
 
-Powers a "previous chats" sidebar: a chronological list of past sessions
-that the user can click to reload verbatim, exactly like Claude's own
-chat history UI.
+Powers a "previous chats" sidebar: a chronological list of past sessions, each with its full transcript of turns. The user can click a session to reload it verbatim.
 
 This is deliberately separate from:
   - short_term.py  (in-RAM only, current session's sliding window)
-  - long_term.py   (semantic recall of similar Q&A + extracted facts,
+  - long_term.py   (semantic recall of similar Q&A,
                      lossy by design — summaries, not full transcripts)
 
 Chat history stores the FULL, UNMODIFIED text of every turn, indexed by
@@ -26,11 +24,11 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 # ---------------------------------------------------------------------------
-# SCHEMA
+# SCHEME
 # ---------------------------------------------------------------------------
 
 _SCHEMA = """
@@ -56,6 +54,8 @@ CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
 """
 
 TITLE_MAX_CHARS = 60
+DEFAULT_MAX_SESSIONS = 10
+DEFAULT_MAX_DB_SIZE_MB = 30
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +73,15 @@ class ChatHistoryStore:
         used by long_term.py — this is a different kind of data).
     """
 
-    def __init__(self, db_path: str = "./chat_history.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "./chat_history.db",
+        max_sessions: int = DEFAULT_MAX_SESSIONS,
+        max_db_size_mb: int = DEFAULT_MAX_DB_SIZE_MB,
+    ) -> None:
         self._path = db_path
+        self.max_sessions = max_sessions
+        self.max_db_size_bytes = max_db_size_mb * 1024 * 1024
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         with self._connect() as conn:
@@ -116,8 +123,7 @@ class ChatHistoryStore:
         Append one turn to a session. Call this after every supervisor.ask(),
         alongside stm.add_turn() — same data, different destination.
 
-        The session title is set from the first turn's question (truncated),
-        the same way Claude auto-titles a new chat from your first message.
+        The session title is set from the first turn's question (truncated).
         """
         now = datetime.now(timezone.utc).isoformat()
         with self._lock, self._connect() as conn:
@@ -145,6 +151,74 @@ class ChatHistoryStore:
                     "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
                     (now, session_id),
                 )
+
+        # Keep the active session, but progressively remove the oldest chats
+        # when either retention limit is exceeded. This runs after saving a
+        # real turn, rather than after start_session(), so repeatedly opening
+        # the application cannot evict useful chats by creating empty ones.
+        self._enforce_retention(protected_session_id=session_id)
+
+    def _enforce_retention(self, protected_session_id: str) -> int:
+        """Apply count and on-disk size limits, oldest session first.
+
+        The protected session is never deleted. SQLite keeps freed pages in
+        its file, so ``VACUUM`` is required after deletions for the 30 MB
+        limit to reflect the real disk usage.
+
+        Returns the number of sessions deleted.
+        """
+        deleted = 0
+        with self._lock:
+            # First enforce the cheap, deterministic session-count limit.
+            while self._session_count_unlocked() > self.max_sessions:
+                if not self._delete_oldest_unlocked(protected_session_id):
+                    break
+                deleted += 1
+
+            if deleted:
+                self._vacuum_unlocked()
+
+            # Then remove one old session at a time until the physical SQLite
+            # file is back under the configured disk threshold.
+            while self._db_size_unlocked() > self.max_db_size_bytes:
+                if not self._delete_oldest_unlocked(protected_session_id):
+                    break
+                deleted += 1
+                self._vacuum_unlocked()
+
+        return deleted
+
+    def _session_count_unlocked(self) -> int:
+        with self._connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+    def _delete_oldest_unlocked(self, protected_session_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM sessions WHERE session_id != ? "
+                "ORDER BY updated_at ASC LIMIT 1",
+                (protected_session_id,),
+            ).fetchone()
+
+            if row is None:
+                return False
+
+            session_id = row["session_id"]
+            conn.execute("DELETE FROM turns WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        return True
+
+    def _vacuum_unlocked(self) -> None:
+        # VACUUM cannot run inside the transaction managed by _connect().
+        conn = sqlite3.connect(self._path)
+        try:
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+
+    def _db_size_unlocked(self) -> int:
+        path = Path(self._path)
+        return path.stat().st_size if path.exists() else 0
 
     # ── Listing / loading (for the UI sidebar) ──────────────────────────────
 
@@ -197,7 +271,7 @@ class ChatHistoryStore:
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
 
     def rename_session(self, session_id: str, new_title: str) -> None:
-        """Let the user manually rename a session, same as in Claude's UI."""
+        """Let the user manually rename a session."""
         now = datetime.now(timezone.utc).isoformat()
         with self._lock, self._connect() as conn:
             conn.execute(

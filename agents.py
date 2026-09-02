@@ -411,12 +411,10 @@ class SupervisorAgent:
         reranker = CrossEncoder(RERANKER_MODEL)
 
         # Memory
-        # `summarizer=self._summarize_turn` plugs the rolling-summary hook:
-        # whenever a turn falls out of the short-term window, it's folded
-        # into a compact summary (via the configured LLM provider) instead
-        # of being lost outright.
-        self.stm = ShortTermMemory(max_turns=10, summarizer=self._summarize_turn)
-        # NOTE: long-term memory (Q&A + facts) still uses ChromaDB — a
+        # Short-term memory is a pure 10-turn RAM window. Appending turn 11
+        # discards turn 1 without making an additional LLM call.
+        self.stm = ShortTermMemory(max_turns=10)
+        # NOTE: long-term Q&A summary memory still uses ChromaDB — a
         # separate concern from the Pinecone-backed RAG document corpus,
         # with its own embedding model (LTM_EMBEDDING_MODEL, see above) —
         # NOT `embedding_model`, deliberately, so LTM is unaffected by
@@ -463,7 +461,7 @@ class SupervisorAgent:
     # ── LTM context formatting ───────────────────────────────────────────────
 
     @staticmethod
-    def _format_ltm_context(hits: List[Tuple[str, str, float]]) -> str:
+    def _format_ltm_context(hits: List[Tuple[str, str, float, str]]) -> str:
         """
         Format long-term-memory hits (similar past Q&A) into a block to
         pass to specialized agents as supporting background. Empty string
@@ -477,9 +475,14 @@ class SupervisorAgent:
             "any article/case identifier mentioned below is NOT a valid "
             "citation; see the system instructions for how to handle this):"
         ]
-        for q, a, _dist in hits:
+        for q, a, _dist, country_scope in hits:
             safe_answer = _defang_bracketed_labels(a)
-            lines.append(f'- Previously asked: "{q}"\n  Previous answer: {safe_answer}')
+            jurisdiction = country_scope.replace("|", ", ")
+            lines.append(
+                f'- Jurisdiction: {jurisdiction}\n'
+                f'  Previously asked: "{q}"\n'
+                f'  Previous answer: {safe_answer}'
+            )
         return "\n".join(lines)
 
     # ── Triage + Routing (single LLM call) ──────────────────────────────────
@@ -632,63 +635,18 @@ class SupervisorAgent:
         )
         return response.choices[0].message.content
 
-    # ── Rolling summary (for short-term memory) ─────────────────────────────
-
-    def _summarize_turn(self, existing_summary: str, turn: Turn) -> str:
-        """
-        Called by ShortTermMemory when a turn is about to fall out of the
-        sliding window. Folds it into a compact rolling summary instead
-        of discarding it outright.
-
-        Any failure here (rate limit, timeout, etc.) must never break the
-        main answer pipeline, so it falls back to a naive one-liner.
-        """
-        try:
-            # thinking=False: rolling-summary bookkeeping, not worth the
-            # extra latency of a reasoning pass.
-            response = self.llm_client.chat.completions.create(
-                model=_MODELS["main"],
-                max_tokens=200,
-                temperature=0.2,
-                **extra_kwargs(thinking=False),
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You maintain a running summary of a legal Q&A "
-                            "conversation. Given the existing summary and one "
-                            "new turn to fold in, return an updated summary "
-                            "that is still concise (a few bullet points max). "
-                            "Preserve country/legal-area context that might "
-                            "matter for follow-up questions. No preamble."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Existing summary:\n{existing_summary or '(none yet)'}\n\n"
-                            f"New turn to fold in:\n"
-                            f"Q: {turn.query}\n"
-                            f"A: {turn.answer}\n"
-                            f"Agents used: {', '.join(turn.agents_activated) or 'none'}"
-                        ),
-                    },
-                ],
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"  [WARN] Rolling summary generation failed: {e}")
-            fallback = f"- {turn.query} (agents: {', '.join(turn.agents_activated) or 'none'})"
-            return (existing_summary + "\n" + fallback).strip() if existing_summary else fallback
-
     # ── Background LTM store ────────────────────────────────────────────────
 
     def _store_in_ltm_background(
-        self, query: str, answer: str, agents_used: List[str]
+        self,
+        query: str,
+        answer: str,
+        agents_used: List[str],
+        countries_used: List[str],
     ) -> None:
         """
         Runs LongTermMemory.store() (which makes an LLM call to produce the
-        summary + facts) in a daemon thread, so the user gets their answer
+        summary) in a daemon thread, so the user gets their answer
         immediately instead of waiting for this second, non-critical LLM call.
 
         Daemon thread: if the process exits before this finishes, it's
@@ -698,7 +656,12 @@ class SupervisorAgent:
         """
         def _run():
             try:
-                self.ltm.store(query=query, answer=answer, agents_used=agents_used)
+                self.ltm.store(
+                    query=query,
+                    answer=answer,
+                    agents_used=agents_used,
+                    countries_used=countries_used,
+                )
             except Exception as e:
                 print(f"  [WARN] Background LTM store failed: {e}")
 
@@ -878,9 +841,17 @@ class SupervisorAgent:
             agents_activated=agent_ids,
         )
         # Runs in the background — the user gets final_answer immediately,
-        # the summary+facts LLM call for LTM happens after the fact.
+        # the summary LLM call for LTM happens after the fact.
+        countries_used = sorted({
+            country
+            for aid in agent_ids
+            for country in self._agents[aid].description.countries
+        })
         self._store_in_ltm_background(
-            query=query, answer=final_answer, agents_used=agent_ids
+            query=query,
+            answer=final_answer,
+            agents_used=agent_ids,
+            countries_used=countries_used,
         )
 
         return final_answer

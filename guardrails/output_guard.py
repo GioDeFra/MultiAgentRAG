@@ -69,12 +69,18 @@ logger = logging.getLogger(__name__)
 # produced false-positive "unsupported" verdicts on genuinely well-grounded
 # claims even with added context.
 CHECK_MODEL = model_names()["check"]
+CORRECTION_MODEL = model_names()["main"]
 
 # Upper bound on how many individual citation checks to run per answer.
 # Citation checks run one LLM call each, so this caps worst-case latency
 # and cost on answers with many citations (mirrors the old code's
 # `retrieved_chunks[:6]` cap, applied per-citation instead of per-answer).
 MAX_CITATIONS_TO_CHECK = 10
+
+# Prevent a correction request from growing without bound when many large
+# retrieved chunks are available. The most useful context is kept in the same
+# insertion order used to build chunk_by_label.
+MAX_CORRECTION_CONTEXT_CHARS = 30_000
 
 CITATION_PATTERN = re.compile(r"\[([^\[\]]+)\]")
 
@@ -180,7 +186,7 @@ def _label_core(label: str) -> str:
 # strings that often contain digits of their own for unrelated reasons
 # (dates, docket numbers, section numbers — e.g. "Court of Appeal of
 # Salerno sec. II, 29/12/2022" contains "29" from the date). Used to gate
-# _is_cross_referenced below: matching a bare number against retrieved
+# _cross_referenced_source_text below: matching a bare number against retrieved
 # text only makes sense for article numbers, never for a case citation's
 # incidental digits.
 _ARTICLE_LABEL = re.compile(
@@ -195,7 +201,7 @@ def _sibling_countries(
     """
     Countries of the OTHER labels cited in the same sentence as `label`,
     used as a proxy for which jurisdiction the sentence is actually
-    about — see _is_cross_referenced. If the sentence cites a Slovenian
+    about — see _cross_referenced_source_text. If the sentence cites a Slovenian
     case alongside the uncorroborated label, that's a strong signal the
     uncorroborated label should also be Slovenian.
     """
@@ -209,15 +215,15 @@ def _sibling_countries(
     return countries
 
 
-def _is_cross_referenced(
+def _cross_referenced_source_text(
     label: str,
     chunk_by_label: Dict[str, str],
     label_country: Optional[Dict[str, str]] = None,
     sentence: str = "",
-) -> bool:
+) -> Optional[str]:
     """
-    True if `label` was not itself retrieved, but is nonetheless named
-    inside the text of a document that WAS retrieved — e.g. "Art. 162" is
+    Return retrieved source text that mentions `label`, when `label` was not
+    itself retrieved — e.g. "Art. 162" is
     not in chunk_by_label, but the retrieved text of "Art. 210" literally
     says "...in accordance with Article 162...". In that case the model
     isn't inventing Article 162 out of nowhere: it's reporting what an
@@ -243,11 +249,11 @@ def _is_cross_referenced(
     # docket numbers) matching some unrelated "Art. N" mention elsewhere
     # is a coincidence, not corroboration.
     if not _ARTICLE_LABEL.match(label.strip()):
-        return False
+        return None
 
     core = _label_core(label)
     if not core:
-        return False
+        return None
     pattern = re.compile(rf"\bArt(?:icle)?\.?\s*{re.escape(core)}\b", re.IGNORECASE)
 
     label_country = label_country or {}
@@ -264,8 +270,8 @@ def _is_cross_referenced(
                 # a numeric coincidence, not real corroboration. Keep
                 # looking rather than accepting this match.
                 continue
-        return True
-    return False
+        return text
+    return None
 
 
 def _extract_citation_claims(answer: str) -> List[Tuple[str, str]]:
@@ -391,6 +397,75 @@ def _check_single_citation(
     return None
 
 
+def _rewrite_with_grounding_feedback(
+    answer: str,
+    chunk_by_label: Dict[str, str],
+    issues: List[Tuple[str, str, str]],
+    llm_client: OpenAI,
+) -> Optional[str]:
+    """Rewrite an answer once, using the detected issues and retrieved text.
+
+    Returns None when the correction call fails or produces an empty response.
+    The caller is responsible for running the corrected answer through the
+    guardrail again; this function deliberately does not decide that its own
+    rewrite is safe.
+    """
+    issue_lines = "\n".join(
+        f'- [{label}] in "{sentence}" — {reason}'
+        for label, sentence, reason in issues
+    )
+
+    source_parts: List[str] = []
+    chars_used = 0
+    issue_labels = [label for label, _, _ in issues]
+    prioritized_labels = list(dict.fromkeys(
+        [
+            base if (base := _base_article_label(label)) in chunk_by_label else label
+            for label in issue_labels
+        ]
+        + list(chunk_by_label)
+    ))
+    for label in prioritized_labels:
+        text = chunk_by_label.get(label)
+        if text is None:
+            continue
+        block = f"SOURCE [{label}]:\n{text}\n"
+        remaining = MAX_CORRECTION_CONTEXT_CHARS - chars_used
+        if remaining <= 0:
+            break
+        source_parts.append(block[:remaining])
+        chars_used += min(len(block), remaining)
+
+    try:
+        response = llm_client.chat.completions.create(
+            model=CORRECTION_MODEL,
+            max_tokens=token_budget(2048, thinking=True),
+            temperature=0,
+            **extra_kwargs(thinking=True),
+            messages=[{
+                "role": "user",
+                "content": (
+                    "The response below has citation-grounding problems. "
+                    "Rewrite it before it is shown to the user, using only "
+                    "information supported by the supplied sources. Correct "
+                    "or remove unsupported claims and unknown/misattributed "
+                    "citations. Preserve useful supported content and cite "
+                    "sources only with their exact bracketed labels. Do not "
+                    "mention this correction process and do not add a preamble.\n\n"
+                    f"DETECTED PROBLEMS:\n{issue_lines}\n\n"
+                    f"ORIGINAL RESPONSE:\n{answer}\n\n"
+                    "RETRIEVED SOURCES:\n"
+                    + "\n".join(source_parts)
+                ),
+            }],
+        )
+        corrected = response.choices[0].message.content.strip()
+        return corrected or None
+    except Exception as e:
+        logger.warning("Automatic grounding correction failed: %s", e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # GROUNDING CHECK (public entry point — name kept for backward compatibility)
 # ---------------------------------------------------------------------------
@@ -400,6 +475,7 @@ def check_grounding(
     chunk_by_label: Dict[str, str],
     llm_client: OpenAI = None,
     label_country: Optional[Dict[str, str]] = None,
+    _correction_attempted: bool = False,
 ) -> str:
     """
     Verify that every "[label]" citation in `answer` is supported by its
@@ -419,7 +495,7 @@ def check_grounding(
         if not provided.
     label_country : Dict[str, str], optional
         Map from citation label to the country of the source it came
-        from. Used only to scope _is_cross_referenced's fallback check
+        from. Used only to scope the indirect-reference fallback check
         (an uncited-but-mentioned label) by jurisdiction, so a same-
         numbered article from an unrelated country's retrieved chunk
         isn't mistaken for corroboration. Safe to omit — falls back to
@@ -465,6 +541,11 @@ def check_grounding(
         # wrong (e.g. a short "no relevant documents" reply), so no
         # warning is added; this differs from the "no chunks retrieved"
         # case above, which IS worth flagging.
+        if _correction_attempted:
+            return (
+                "[NOTE: the guardrail corrected citation-grounding issues and "
+                "the revised answer passed the second check.]\n\n" + answer
+            )
         return answer
 
     logger.debug("Extracted citation claims: %s", claims)
@@ -501,14 +582,17 @@ def check_grounding(
                 )
 
         if source_text is None:
-            if _is_cross_referenced(label, chunk_by_label, label_country, sentence):
+            source_text = _cross_referenced_source_text(
+                label, chunk_by_label, label_country, sentence
+            )
+            if source_text is not None:
                 logger.debug(
-                    "Citation [%s] not directly retrieved, but corroborated "
-                    "by another retrieved source — not flagged.", label
+                    "Citation [%s] not directly retrieved, but mentioned by "
+                    "another source; verifying the claim against that source.", label
                 )
             else:
                 unknown_label.append((label, sentence))
-            continue
+                continue
 
         try:
             verdict = _check_single_citation(
@@ -534,7 +618,40 @@ def check_grounding(
     # (e.g. a second, differently-broken citation in the same answer)
     # from the warning shown to the user.
     if not (unknown_label or unsupported or unverifiable or skipped_claims):
+        if _correction_attempted:
+            return (
+                "[NOTE: the guardrail corrected citation-grounding issues and "
+                "the revised answer passed the second check.]\n\n" + answer
+            )
         return answer
+
+    # Rewrite only for concrete grounding failures. A timeout/unrecognized
+    # checker verdict and claims skipped due to the cap do not prove that the
+    # answer itself is wrong, so rewriting for those cases could make it worse.
+    concrete_issues: List[Tuple[str, str, str]] = [
+        (label, sentence, "citation label was not found in the retrieved sources")
+        for label, sentence in unknown_label
+    ] + [
+        (label, sentence, "the cited source does not support this claim")
+        for label, sentence in unsupported
+    ]
+
+    correction_failed = False
+    if concrete_issues and not _correction_attempted:
+        corrected = _rewrite_with_grounding_feedback(
+            answer, chunk_by_label, concrete_issues, llm_client
+        )
+        if corrected:
+            # Exactly one retry: the private flag prevents an infinite
+            # correction loop if the rewritten answer still has problems.
+            return check_grounding(
+                corrected,
+                chunk_by_label,
+                llm_client,
+                label_country=label_country,
+                _correction_attempted=True,
+            )
+        correction_failed = True
 
     def _snippet(sentence: str, max_len: int = 100) -> str:
         s = sentence.strip()
@@ -548,7 +665,18 @@ def check_grounding(
             out.append(f'  - [{label}] "{_snippet(sentence)}" — {reason}')
         return out
 
-    lines = ["[WARNING: possible citation issue(s) in this answer]"]
+    if _correction_attempted:
+        lines = [
+            "[WARNING: the guardrail corrected the answer, but the second "
+            "check still found possible citation issue(s).]"
+        ]
+    else:
+        lines = ["[WARNING: possible citation issue(s) in this answer]"]
+
+    if correction_failed:
+        lines.append(
+            "  - An automatic correction was attempted but could not be completed."
+        )
 
     lines += _format_group(
         unknown_label,

@@ -1,0 +1,211 @@
+"""
+memory/chat_history.py — Full-fidelity chat session history.
+
+Powers a "previous chats" sidebar: a chronological list of past sessions
+that the user can click to reload verbatim, exactly like Claude's own
+chat history UI.
+
+This is deliberately separate from:
+  - short_term.py  (in-RAM only, current session's sliding window)
+  - long_term.py   (semantic recall of similar Q&A + extracted facts,
+                     lossy by design — summaries, not full transcripts)
+
+Chat history stores the FULL, UNMODIFIED text of every turn, indexed by
+session, so the user can reopen and re-read a past conversation exactly
+as it happened. No embeddings, no similarity search, no summarization —
+just persistent, chronological storage.
+
+Backed by SQLite (stdlib only, no extra dependency) since access here is
+"list sessions" / "load this session by id", not semantic search.
+"""
+
+import json
+import sqlite3
+import threading
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+# ---------------------------------------------------------------------------
+# SCHEMA
+# ---------------------------------------------------------------------------
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id  TEXT PRIMARY KEY,
+    title       TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS turns (
+    session_id        TEXT NOT NULL,
+    turn_id           INTEGER NOT NULL,
+    query             TEXT NOT NULL,
+    answer            TEXT NOT NULL,
+    agents_activated  TEXT NOT NULL,   -- JSON list
+    timestamp         TEXT NOT NULL,
+    PRIMARY KEY (session_id, turn_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
+"""
+
+TITLE_MAX_CHARS = 60
+
+
+# ---------------------------------------------------------------------------
+# CHAT HISTORY STORE
+# ---------------------------------------------------------------------------
+
+class ChatHistoryStore:
+    """
+    Persistent, chronological store of full chat sessions.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite file (separate from the ChromaDB directory
+        used by long_term.py — this is a different kind of data).
+    """
+
+    def __init__(self, db_path: str = "./chat_history.db") -> None:
+        self._path = db_path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        with self._connect() as conn:
+            conn.executescript(_SCHEMA)
+
+    @contextmanager
+    def _connect(self):
+        conn = sqlite3.connect(self._path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ── Session lifecycle ────────────────────────────────────────────────────
+
+    def start_session(self) -> str:
+        """Create a new empty session and return its id."""
+        session_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO sessions (session_id, title, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, "New chat", now, now),
+            )
+        return session_id
+
+    def save_turn(
+        self,
+        session_id: str,
+        turn_id: int,
+        query: str,
+        answer: str,
+        agents_activated: List[str],
+    ) -> None:
+        """
+        Append one turn to a session. Call this after every supervisor.ask(),
+        alongside stm.add_turn() — same data, different destination.
+
+        The session title is set from the first turn's question (truncated),
+        the same way Claude auto-titles a new chat from your first message.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO turns "
+                "(session_id, turn_id, query, answer, agents_activated, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, turn_id, query, answer, json.dumps(agents_activated), now),
+            )
+
+            row = conn.execute(
+                "SELECT title FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            is_first_turn = turn_id == 0
+            if row and is_first_turn:
+                title = query.strip().replace("\n", " ")
+                if len(title) > TITLE_MAX_CHARS:
+                    title = title[:TITLE_MAX_CHARS].rsplit(" ", 1)[0] + "..."
+                conn.execute(
+                    "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
+                    (title, now, session_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                    (now, session_id),
+                )
+
+    # ── Listing / loading (for the UI sidebar) ──────────────────────────────
+
+    def list_sessions(self, limit: int = 50) -> List[Dict]:
+        """
+        Return sessions most-recently-updated first — exactly what a
+        sidebar needs: session_id, title, timestamps, turn count.
+        """
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.session_id, s.title, s.created_at, s.updated_at,
+                       COUNT(t.turn_id) AS turn_count
+                FROM sessions s
+                LEFT JOIN turns t ON t.session_id = s.session_id
+                GROUP BY s.session_id
+                ORDER BY s.updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def load_session(self, session_id: str) -> List[Dict]:
+        """
+        Return all turns for a session, oldest first — call this when the
+        user clicks a session in the sidebar to reload it verbatim.
+        """
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT turn_id, query, answer, agents_activated, timestamp "
+                "FROM turns WHERE session_id = ? ORDER BY turn_id ASC",
+                (session_id,),
+            ).fetchall()
+        return [
+            {
+                "turn_id": r["turn_id"],
+                "query": r["query"],
+                "answer": r["answer"],
+                "agents_activated": json.loads(r["agents_activated"]),
+                "timestamp": r["timestamp"],
+            }
+            for r in rows
+        ]
+
+    def delete_session(self, session_id: str) -> None:
+        """Permanently remove a session and its turns."""
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM turns WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
+    def rename_session(self, session_id: str, new_title: str) -> None:
+        """Let the user manually rename a session, same as in Claude's UI."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
+                (new_title.strip()[:TITLE_MAX_CHARS], now, session_id),
+            )
+
+    def __repr__(self) -> str:
+        with self._lock, self._connect() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        return f"ChatHistoryStore(sessions={count})"

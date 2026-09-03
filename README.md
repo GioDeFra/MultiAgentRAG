@@ -120,7 +120,7 @@ LLM_PROVIDER=groq
 GROQ_API_KEY=your_groq_key
 DEEPSEEK_API_KEY=your_deepseek_key
 GEMINI_API_KEY=your_gemini_key
-ZAI_API_KEY=your_zai_key
+
 
 PINECONE_API_KEY=your_pinecone_key
 HF_TOKEN=your_hugging_face_token

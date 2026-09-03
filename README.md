@@ -15,6 +15,8 @@ MultiAgentRAG is a multi-agent retrieval-augmented generation system for answeri
 - Ten-turn, in-memory conversational context
 - Cross-session semantic memory backed by ChromaDB
 - Full chat-session history backed by SQLite
+- Transparent source cards with country, document type, article references, and excerpts
+- Human-readable JSON interaction logging for evaluation and auditing
 - Local Gradio interface with previous-chat navigation
 - Configurable OpenAI-compatible LLM providers: Groq, DeepSeek, Gemini, and z.ai
 
@@ -63,7 +65,7 @@ All specialist agents query the same `legal-rag` Pinecone index. The registry in
 | `Ingestion.ipynb` | Dataset validation, chunking, embedding, and Pinecone ingestion workflow |
 | `Contest_Data.zip` | Packaged source dataset |
 
-The application creates `chroma_db/` for long-term memory and `chat_history.db` for complete chat transcripts at runtime.
+The application creates `chroma_db/` for long-term memory, `chat_history.db` for complete chat transcripts, and the human-readable `chat_history.json` export at runtime.
 
 ## Prerequisites
 
@@ -174,6 +176,7 @@ To change routing coverage or add an agent, update `AGENT_REGISTRY` in `config.p
 - **Short-term memory:** keeps the latest ten completed turns in RAM for the active session.
 - **Long-term memory:** stores concise summaries of retrieval-grounded answers in `chroma_db/` and recalls similar past questions for the relevant agents. It supplements, but never replaces, current document retrieval.
 - **Chat history:** stores complete, unmodified session transcripts in `chat_history.db` for the previous-chats sidebar.
+- **Structured log:** refreshes `chat_history.json` after every turn, including all retained sessions, questions, answers, activated agents, retrieved documents, and their key metadata. The indented file can be opened directly in a text editor or browser.
 
 Direct, non-retrieval answers are saved to chat history and short-term memory, but not to long-term semantic memory.
 

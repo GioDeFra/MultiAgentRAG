@@ -24,7 +24,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS turns (
     query             TEXT NOT NULL,
     answer            TEXT NOT NULL,
     agents_activated  TEXT NOT NULL,   -- JSON list
+    retrieved_documents TEXT NOT NULL DEFAULT '[]', -- JSON list
     timestamp         TEXT NOT NULL,
     PRIMARY KEY (session_id, turn_id),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
@@ -80,6 +81,7 @@ class ChatHistoryStore:
         max_db_size_mb: int = DEFAULT_MAX_DB_SIZE_MB,
     ) -> None:
         self._path = db_path
+        self._json_path = str(Path(db_path).with_suffix(".json"))
         self.max_sessions = max_sessions
         self.max_db_size_bytes = max_db_size_mb * 1024 * 1024
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -119,6 +121,7 @@ class ChatHistoryStore:
         query: str,
         answer: str,
         agents_activated: List[str],
+        retrieved_documents: Optional[List[Dict]] = None,
     ) -> None:
         """
         Append one turn to a session. Call this after every supervisor.ask(),
@@ -127,12 +130,21 @@ class ChatHistoryStore:
         The session title is set from the first turn's question (truncated).
         """
         now = datetime.now(timezone.utc).isoformat()
+        retrieved_documents = retrieved_documents or []
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO turns "
-                "(session_id, turn_id, query, answer, agents_activated, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (session_id, turn_id, query, answer, json.dumps(agents_activated), now),
+                "(session_id, turn_id, query, answer, agents_activated, "
+                "retrieved_documents, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    turn_id,
+                    query,
+                    answer,
+                    json.dumps(agents_activated, ensure_ascii=False),
+                    json.dumps(retrieved_documents, ensure_ascii=False),
+                    now,
+                ),
             )
 
             row = conn.execute(
@@ -158,6 +170,56 @@ class ChatHistoryStore:
         # real turn, rather than after start_session(), so repeatedly opening
         # the application cannot evict useful chats by creating empty ones.
         self._enforce_retention(protected_session_id=session_id)
+
+        self._export_json()
+
+    def _export_json(self) -> None:
+        """Write a human-readable JSON snapshot of all retained sessions."""
+        try:
+            with self._lock, self._connect() as conn:
+                session_rows = conn.execute(
+                    "SELECT session_id, title, created_at, updated_at "
+                    "FROM sessions ORDER BY updated_at DESC"
+                ).fetchall()
+                sessions = []
+                for session in session_rows:
+                    turn_rows = conn.execute(
+                        "SELECT turn_id, query, answer, agents_activated, "
+                        "retrieved_documents, timestamp FROM turns "
+                        "WHERE session_id = ? ORDER BY turn_id ASC",
+                        (session["session_id"],),
+                    ).fetchall()
+                    sessions.append({
+                        "session_id": session["session_id"],
+                        "title": session["title"],
+                        "created_at": session["created_at"],
+                        "updated_at": session["updated_at"],
+                        "turns": [
+                            {
+                                "turn_id": turn["turn_id"],
+                                "timestamp": turn["timestamp"],
+                                "user_question": turn["query"],
+                                "system_answer": turn["answer"],
+                                "agents_activated": json.loads(turn["agents_activated"]),
+                                "retrieved_documents": json.loads(
+                                    turn["retrieved_documents"]
+                                ),
+                            }
+                            for turn in turn_rows
+                        ],
+                    })
+
+            destination = Path(self._json_path)
+            temporary = destination.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps({"sessions": sessions}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(destination)
+        except (OSError, sqlite3.Error, json.JSONDecodeError):
+            # SQLite remains authoritative if the readable export cannot be
+            # refreshed because of a transient filesystem or data problem.
+            pass
 
     def _enforce_retention(self, protected_session_id: str) -> int:
         """Apply count and on-disk size limits, oldest session first.
@@ -256,7 +318,8 @@ class ChatHistoryStore:
             if exists is None:
                 raise ValueError(f"Unknown chat session: {session_id}")
             rows = conn.execute(
-                "SELECT turn_id, query, answer, agents_activated, timestamp "
+                "SELECT turn_id, query, answer, agents_activated, "
+                "retrieved_documents, timestamp "
                 "FROM turns WHERE session_id = ? ORDER BY turn_id ASC",
                 (session_id,),
             ).fetchall()
@@ -266,6 +329,7 @@ class ChatHistoryStore:
                 "query": r["query"],
                 "answer": r["answer"],
                 "agents_activated": json.loads(r["agents_activated"]),
+                "retrieved_documents": json.loads(r["retrieved_documents"]),
                 "timestamp": r["timestamp"],
             }
             for r in rows

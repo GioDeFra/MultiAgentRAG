@@ -86,6 +86,7 @@ class PartialAnswer:
     # Used by the output guardrail to verify citations against the correct source.
 
     labeled_chunks: List[Tuple[str, str, str, str]]
+    retrieved_documents: List[dict]
     relevance_score: float
 
 
@@ -124,6 +125,60 @@ _CONTEXT_LINE_SKIP_KEYS = {
 _CONTEXT_LINE_PLACEHOLDER_VALUES = {
     "", "no data", "not specified", "n/a", "unknown",
 }
+
+SOURCE_EXCERPT_CHARS = 320
+
+
+def _source_name(source: str) -> str:
+    """Return the final path component for either POSIX or Windows paths."""
+    return re.split(r"[/\\]", source)[-1] or source
+
+
+def _article_references(meta: dict, label: str) -> List[str]:
+    """Collect article references from metadata, falling back to the label."""
+    values = []
+    for key in ("article", "articles", "civil_codes_used"):
+        value = meta.get(key)
+        if isinstance(value, list):
+            values.extend(str(item).strip() for item in value if str(item).strip())
+        elif value not in (None, ""):
+            values.append(str(value).strip())
+    if not values:
+        values = re.findall(r"(?:Art\.?|Article|§)\s*\d+[A-Za-z]*(?:[-./]\w+)?", label, re.IGNORECASE)
+    return list(dict.fromkeys(values))
+
+
+def _source_appendix(documents: List[dict]) -> str:
+    """Render compact retrieval evidence for display below the answer."""
+    if not documents:
+        return (
+            "\n\n---\n\n### Sources used\n\n"
+            "No documentary sources were retrieved for this response."
+        )
+    lines = ["\n\n---\n\n### Sources used"]
+    for index, document in enumerate(documents, start=1):
+        articles = ", ".join(document["articles"]) or "Not specified"
+        lines.extend([
+            f"\n**{index}. {document['document_name']}**",
+            f"- Country: {document['country'] or 'Not specified'}",
+            f"- Document type: {document['document_type'] or 'Not specified'}",
+            f"- Citation label: `{document['citation_label']}`",
+            f"- Articles mentioned: {articles}",
+            f"- Source: `{document['source']}`",
+            f"- Relevant excerpt: “{document['excerpt']}”",
+        ])
+    return "\n".join(lines)
+
+
+def _deduplicate_documents(documents: List[dict]) -> List[dict]:
+    """Keep one display/log entry per source and citation label."""
+    unique = {}
+    for document in documents:
+        key = (document["source"], document["citation_label"])
+        existing = unique.get(key)
+        if existing is None or document["relevance_score"] > existing["relevance_score"]:
+            unique[key] = document
+    return list(unique.values())
 
 
 def _build_metadata_line(meta: dict) -> str:
@@ -298,6 +353,7 @@ class SpecializedAgent:
                 agent_name=self.description.agent_id,
                 answer="No relevant documents found in this agent's knowledge base.",
                 labeled_chunks=[],
+                retrieved_documents=[],
                 relevance_score=0.0,
             )
 
@@ -337,6 +393,7 @@ class SpecializedAgent:
 
         context_parts = []
         labeled_chunks: List[Tuple[str, str, str, str]] = []
+        retrieved_documents: List[dict] = []
         retained_scores: List[float] = []
         for score, doc, meta, label, source in prepared_chunks:
             # A label shared by different source documents cannot be verified
@@ -351,6 +408,21 @@ class SpecializedAgent:
             # just raw_chunk — see PartialAnswer.labeled_chunks docstring.
             grounding_text = f"{meta_line}\n{raw_chunk}" if meta_line else raw_chunk
             labeled_chunks.append((label, grounding_text, country, source))
+            excerpt = re.sub(r"\s+", " ", raw_chunk).strip()
+            if len(excerpt) > SOURCE_EXCERPT_CHARS:
+                excerpt = excerpt[:SOURCE_EXCERPT_CHARS].rsplit(" ", 1)[0] + "…"
+            retrieved_documents.append({
+                "agent_id": self.description.agent_id,
+                "citation_label": label,
+                "document_name": _source_name(source),
+                "source": source,
+                "country": country,
+                "document_type": str(meta.get("doc_type") or ""),
+                "legal_area": str(meta.get("law") or ""),
+                "articles": _article_references(meta, label),
+                "excerpt": excerpt,
+                "relevance_score": round(float(score), 4),
+            })
             retained_scores.append(score)
             context_parts.append(
                 f"[{label}] {meta_line} | Source: {source}\n{raw_chunk}"
@@ -362,6 +434,7 @@ class SpecializedAgent:
                 agent_name=self.description.agent_id,
                 answer="No unambiguous, citable documents were found in this agent's knowledge base.",
                 labeled_chunks=[],
+                retrieved_documents=[],
                 relevance_score=0.0,
             )
         context = "\n\n---\n\n".join(context_parts)
@@ -448,6 +521,7 @@ class SpecializedAgent:
             agent_name=self.description.agent_id,
             answer=answer_text,
             labeled_chunks=labeled_chunks,
+            retrieved_documents=retrieved_documents,
             relevance_score=relevance,
         )
 
@@ -900,6 +974,7 @@ class SupervisorAgent:
         # ── Direct answer path ───────────────────────────────────────────────
         if not needs_retrieval and direct_answer:
             print("[Supervisor] Answering directly (no retrieval needed).")
+            direct_answer += _source_appendix([])
             turn = self.stm.add_turn(
                 query=query,
                 agents_activated=[],
@@ -925,7 +1000,7 @@ class SupervisorAgent:
                 "I could not identify a sufficiently specific jurisdiction or "
                 "legal area for retrieval. Please mention the country and whether "
                 "the question concerns divorce or inheritance."
-            )
+            ) + _source_appendix([])
             turn = self.stm.add_turn(query, [], answer)
             self.history.save_turn(
                 self.session_id, turn.turn_id, query, answer, []
@@ -988,6 +1063,7 @@ class SupervisorAgent:
                 )
             else:
                 answer = "No relevant, unambiguous documents were found for this question."
+            answer += _source_appendix([])
             turn = self.stm.add_turn(query, [], answer)
             self.history.save_turn(
                 self.session_id, turn.turn_id, query, answer, []
@@ -1093,17 +1169,24 @@ class SupervisorAgent:
 
         # Update memory
         successful_agent_ids = [partial.agent_id for partial in partials]
+        retrieved_documents = _deduplicate_documents([
+            document
+            for partial in partials
+            for document in partial.retrieved_documents
+        ])
+        display_answer = final_answer + _source_appendix(retrieved_documents)
         turn = self.stm.add_turn(
             query=query,
             agents_activated=successful_agent_ids,
-            answer=final_answer,
+            answer=display_answer,
         )
         self.history.save_turn(
             session_id=self.session_id,
             turn_id=turn.turn_id,
             query=query,
-            answer=final_answer,
+            answer=display_answer,
             agents_activated=successful_agent_ids,
+            retrieved_documents=retrieved_documents,
         )
         # Runs in the background — the user gets final_answer immediately,
         # the summary LLM call for LTM happens after the fact.
@@ -1119,4 +1202,4 @@ class SupervisorAgent:
             countries_used=countries_used,
         )
 
-        return final_answer
+        return display_answer

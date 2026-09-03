@@ -17,6 +17,24 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / "Apikey.env")
 DEBUG_MODE = os.environ.get("LEGAL_RAG_DEBUG", "false").strip().lower() == "true"
 
+# Some Conda/IDE terminals leave SSL_CERT_FILE pointing to an environment or
+# certificate bundle that no longer exists. httpx reads it while Gradio is
+# imported, so repair it before importing Gradio rather than disabling TLS.
+configured_ca_bundle = os.environ.get("SSL_CERT_FILE")
+if configured_ca_bundle and not Path(configured_ca_bundle).is_file():
+    try:
+        import certifi
+    except ImportError:
+        # With no explicit path, httpx/ssl can fall back to their normal CA
+        # discovery. Keeping a known-invalid path would always crash.
+        os.environ.pop("SSL_CERT_FILE", None)
+    else:
+        certifi_ca_bundle = Path(certifi.where())
+        if certifi_ca_bundle.is_file():
+            os.environ["SSL_CERT_FILE"] = str(certifi_ca_bundle)
+        else:
+            os.environ.pop("SSL_CERT_FILE", None)
+
 hf_token = os.environ.get("HF_TOKEN")
 if hf_token:
     os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token

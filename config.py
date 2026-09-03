@@ -8,7 +8,7 @@ queries, via a metadata filter.
 Cases and civil codes are NOT split into separate Pinecone namespaces or
 indexes — they all live in one index, and each agent's `pinecone_filter`
 picks out its slice via `country` / `law` / `doc_type` metadata (see
-ingestion.py, which is what actually writes those fields on every vector).
+Ingestion.ipynb, which is what actually writes those fields on every vector).
 
 The supervisor (agents.py) reads this file to decide which agent
 to route the user's question to, and to build each SpecializedAgent's
@@ -28,7 +28,7 @@ class AgentDescription:
     description: str             # text read by the supervisor for routing decisions
     pinecone_filter: Dict = field(default_factory=dict)
     #   Passed as-is to pine_index.query(filter=...). Built from the same
-    #   vocabulary ingestion.py writes: law is "Divorce" or "Inheritance",
+    #   vocabulary Ingestion.ipynb writes: law is "Divorce" or "Inheritance",
     #   and doc_type is "Legal Cases" or "Civil Codes" — doc_type is now
     #   purely structural (case-law vs statute); it no longer encodes the
     #   legal area itself, `law` is the only field that does that, for

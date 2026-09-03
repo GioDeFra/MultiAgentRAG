@@ -54,7 +54,7 @@ from memory.short_term import ShortTermMemory, Turn
 # Model names now come from llm_client.py, so they can be provider-specific and centrally managed.
 _MODELS = model_names()
 
-EMBEDDING_MODEL  = "BAAI/bge-m3"  # MUST match the model used in ingestion_bge_m3.ipynb.
+EMBEDDING_MODEL  = "BAAI/bge-m3"  # MUST match the model used in Ingestion.ipynb.
 
 RERANKER_MODEL   = "BAAI/bge-reranker-v2-m3"  # Same family as EMBEDDING_MODEL
                                               # (BGE-M3).
@@ -197,7 +197,7 @@ class SpecializedAgent:
         """
         try:
             # normalize_embeddings=True to match how vectors were written
-            # at ingestion time (ingestion_bge_m3.ipynb, upsert_docs) —
+            # at ingestion time (Ingestion.ipynb, upsert_records) —
             # BGE-M3's own docs recommend normalised embeddings for
             # cosine-similarity retrieval.
             query_vector = self.embed_model.encode(
@@ -483,7 +483,7 @@ class SupervisorAgent:
         pinecone_index = pc.Index(pinecone_index_name)
 
         # Query-time embedding model — MUST match whatever ingestion wrote
-        # to Pinecone (see ingestion_bge_m3.ipynb EMBED_MODEL_NAME).
+        # to Pinecone (see EMBED_MODEL_NAME in Ingestion.ipynb).
         # Shared across all agents since it's only used to embed the
         # user's question, not documents.
         embed_model = SentenceTransformer(embedding_model)
@@ -1008,7 +1008,7 @@ class SupervisorAgent:
         # chunks.
         #
         # A single source document is often split into multiple chunks
-        # (see chunk_text in ingestion.py) that all carry the SAME label —
+        # (see chunk_text in Ingestion.ipynb) that all carry the SAME label —
         # e.g. a long civil-code article retrieved as two separate top-k
         # hits. A plain dict comprehension would let the later chunk
         # silently overwrite the earlier one, leaving only a fragment of

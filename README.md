@@ -176,7 +176,7 @@ To change routing coverage or add an agent, update `AGENT_REGISTRY` in `config.p
 - **Short-term memory:** keeps the latest ten completed turns in RAM for the active session.
 - **Long-term memory:** stores concise summaries of retrieval-grounded answers in `chroma_db/` and recalls similar past questions for the relevant agents. It supplements, but never replaces, current document retrieval.
 - **Chat history:** stores complete, unmodified session transcripts in `chat_history.db` for the previous-chats sidebar.
-- **Structured log:** refreshes `chat_history.json` after every turn, including all retained sessions, questions, answers, activated agents, retrieved documents, and their key metadata. The indented file can be opened directly in a text editor or browser.
+- **Structured log:** refreshes `chat_history.json` after every turn with session details, questions, answers, activated agents, and retrieved-document metadata. Source excerpts remain visible in the chat but are the only document field excluded from this export. The indented file can be opened directly in a text editor or browser.
 
 Direct, non-retrieval answers are saved to chat history and short-term memory, but not to long-term semantic memory.
 

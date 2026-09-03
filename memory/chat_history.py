@@ -57,6 +57,12 @@ CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
 TITLE_MAX_CHARS = 60
 DEFAULT_MAX_SESSIONS = 10
 DEFAULT_MAX_DB_SIZE_MB = 30
+SOURCE_APPENDIX_MARKER = "\n\n---\n\n### Sources used"
+
+
+def _answer_without_source_appendix(answer: str) -> str:
+    """Exclude the chat-only source display from the compact JSON export."""
+    return answer.split(SOURCE_APPENDIX_MARKER, 1)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +180,7 @@ class ChatHistoryStore:
         self._export_json()
 
     def _export_json(self) -> None:
-        """Write a human-readable JSON snapshot of all retained sessions."""
+        """Write a complete JSON history while excluding source excerpts."""
         try:
             with self._lock, self._connect() as conn:
                 session_rows = conn.execute(
@@ -189,30 +195,44 @@ class ChatHistoryStore:
                         "WHERE session_id = ? ORDER BY turn_id ASC",
                         (session["session_id"],),
                     ).fetchall()
+                    turns = []
+                    for turn in turn_rows:
+                        documents = json.loads(turn["retrieved_documents"])
+                        turns.append({
+                            "turn_id": turn["turn_id"],
+                            "timestamp": turn["timestamp"],
+                            "user_question": turn["query"],
+                            "system_answer": _answer_without_source_appendix(
+                                turn["answer"]
+                            ),
+                            "agents_activated": json.loads(
+                                turn["agents_activated"]
+                            ),
+                            "retrieved_documents": [
+                                {
+                                    key: value
+                                    for key, value in document.items()
+                                    if key != "excerpt"
+                                }
+                                for document in documents
+                            ],
+                        })
                     sessions.append({
                         "session_id": session["session_id"],
                         "title": session["title"],
                         "created_at": session["created_at"],
                         "updated_at": session["updated_at"],
-                        "turns": [
-                            {
-                                "turn_id": turn["turn_id"],
-                                "timestamp": turn["timestamp"],
-                                "user_question": turn["query"],
-                                "system_answer": turn["answer"],
-                                "agents_activated": json.loads(turn["agents_activated"]),
-                                "retrieved_documents": json.loads(
-                                    turn["retrieved_documents"]
-                                ),
-                            }
-                            for turn in turn_rows
-                        ],
+                        "turns": turns,
                     })
 
             destination = Path(self._json_path)
             temporary = destination.with_suffix(".json.tmp")
             temporary.write_text(
-                json.dumps({"sessions": sessions}, ensure_ascii=False, indent=2),
+                json.dumps(
+                    {"sessions": sessions},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
             temporary.replace(destination)

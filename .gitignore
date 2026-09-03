@@ -1,3 +1,13 @@
 Apikey.env
 
 Contest_Data/
+
+_pycache__/
+
+chroma_db/
+
+guardrails/_pycache__
+
+memory/_pycache__
+
+chat_history-db/

@@ -15,42 +15,36 @@ SupervisorAgent
     and runs the output guardrail. Also manages short-term, long-term,
     and chat-history memory.
 """
-import os
-from pathlib import Path
-from dotenv import load_dotenv
-
-# Set HF token before loading any models
-hf_token = os.environ.get("HF_TOKEN")
-if hf_token:
-    os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
-
 import json
 import logging
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
+
+# Environment variables, including HF_TOKEN, must be loaded before importing
+# sentence-transformers/Hugging Face. Otherwise a token present only in
+# Apikey.env is invisible while those libraries initialise.
+load_dotenv(Path(__file__).parent / "Apikey.env")
+hf_token = os.environ.get("HF_TOKEN")
+if hf_token:
+    os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
+
 from openai import OpenAI
 from pinecone import Pinecone
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from config import AGENT_MAP, AGENT_REGISTRY, AgentDescription
 from guardrails.output_guard import check_grounding
-from llm_client import get_llm_client, model_names, extra_kwargs, token_budget
+from llm_client import get_llm_client, model_names
 from memory.chat_history import ChatHistoryStore
 from memory.long_term import LongTermMemory
 from memory.short_term import ShortTermMemory, Turn
-
-
-# ---------------------------------------------------------------------------
-# LOAD API KEY
-# ---------------------------------------------------------------------------
-
-load_dotenv(Path(__file__).parent / "Apikey.env")
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +66,7 @@ LTM_EMBEDDING_MODEL = "all-mpnet-base-v2"
 
 PINECONE_INDEX_NAME = "legal-rag"
 DB_DIR = "./chroma_db"   # long-term memory store only, not the RAG corpus
+MAX_PARALLEL_AGENTS = 4
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +81,63 @@ class PartialAnswer:
     agent_name: str
     answer: str
 
-    # Sources shown to the LLM as: (citation label, text and metadata, country).
+    # Sources shown to the LLM as:
+    # (citation label, text and metadata, country, source identifier).
     # Used by the output guardrail to verify citations against the correct source.
 
-    labeled_chunks: List[Tuple[str, str, str]]
+    labeled_chunks: List[Tuple[str, str, str, str]]
     relevance_score: float
+
+
+# ---------------------------------------------------------------------------
+# CONTEXT / CITATION HELPERS
+# ---------------------------------------------------------------------------
+
+_ARTICLE_HEADING = re.compile(
+    r"^\s*(?:(?:ARTICLE|ART\.?)\s+)?(?P<number>\d+[A-Za-z]*(?:[-./][A-Za-z0-9]+)?)\.?"
+    r"[ \t]*(?:\r?\n|$)",
+    re.IGNORECASE,
+)
+
+
+def _citation_label(meta: dict) -> str:
+    """Read the canonical label written by ingestion; never invent one."""
+    return str(meta.get("citation_label") or "").strip()
+
+
+def _strip_redundant_heading(text: str, label: str) -> str:
+    """Remove a repeated leading article number from statute text."""
+    if "Art." not in label:
+        return text
+    return _ARTICLE_HEADING.sub("", text, count=1)
+
+
+def _defang_bracketed_labels(text: str) -> str:
+    """Prevent labels recalled from long-term memory becoming citations."""
+    return text.replace("[", "(").replace("]", ")")
+
+
+_CONTEXT_LINE_SKIP_KEYS = {
+    "CASE_ID", "citation_label", "country", "doc_type", "law", "source",
+    "text", "chunk_index", "n_chunks",
+}
+_CONTEXT_LINE_PLACEHOLDER_VALUES = {
+    "", "no data", "not specified", "n/a", "unknown",
+}
+
+
+def _build_metadata_line(meta: dict) -> str:
+    """Render useful source metadata without repeating internal fields."""
+    parts = []
+    for key, value in meta.items():
+        if key in _CONTEXT_LINE_SKIP_KEYS or value in (None, [], {}):
+            continue
+        if isinstance(value, str) and value.strip().lower() in _CONTEXT_LINE_PLACEHOLDER_VALUES:
+            continue
+        if isinstance(value, list):
+            value = ", ".join(str(item) for item in value)
+        parts.append(f"{key}: {value}")
+    return "; ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +243,7 @@ class SpecializedAgent:
 
     def _rerank(
         self, query: str, candidates: List[Tuple[str, dict]]
-    ) -> List[Tuple[str, dict]]:
+    ) -> List[Tuple[float, str, dict]]:
         """Use a cross-encoder to rerank candidates by true relevance."""
         if not candidates:
             return []
@@ -223,7 +270,10 @@ class SpecializedAgent:
             key=lambda x: x[0],
             reverse=True,
         )
-        return [cand for _, cand in ranked[: self.top_k]]
+        return [
+            (float(score), document, metadata)
+            for score, (document, metadata) in ranked[: self.top_k]
+        ]
 
     # ── Answer generation ────────────────────────────────────────────────────
 
@@ -251,32 +301,68 @@ class SpecializedAgent:
                 relevance_score=0.0,
             )
 
-        # Build context block. Field names match what ingestion_bge_m3.ipynb
+        # Build context block. Field names match what Ingestion.ipynb
         # actually writes to Pinecone metadata: "text" (the raw chunk) and
         # "source" (the source file path) — NOT "raw_chunk"/"source_file".
         #
-        # Each chunk is labelled with its real identity (CASE_ID for
-        # case-law, civil_codes_used for civil-code articles — see
-        # _doc_label above) instead of an arbitrary "Doc {i}" index, so the
-        # LLM has no reason to cite the wrong source: the label IS the
-        # citation.
+        # Each chunk is labelled during ingestion and the canonical
+        # citation_label metadata is used here verbatim. Query-time code must
+        # never derive a different label from article references or headings.
+        prepared_chunks = []
+        sources_by_label: Dict[str, str] = {}
+        ambiguous_labels = set()
+        for _score, doc, meta in top_chunks:
+            label = _citation_label(meta)
+            source = str(meta.get("source") or "unknown source")
+            if not label:
+                logger.warning(
+                    "Skipping retrieved chunk without citation_label (source=%s). "
+                    "Re-run ingestion if this is an old Pinecone record.",
+                    source,
+                )
+                continue
+            previous_source = sources_by_label.get(label)
+            if previous_source is not None and previous_source != source:
+                ambiguous_labels.add(label)
+            else:
+                sources_by_label[label] = source
+            prepared_chunks.append((_score, doc, meta, label, source))
+
+        if ambiguous_labels:
+            logger.warning(
+                "Ignoring non-unique citation labels returned to agent %s: %s",
+                self.description.agent_id,
+                sorted(ambiguous_labels),
+            )
+
         context_parts = []
-        labeled_chunks: List[Tuple[str, str, str]] = []
-        for i, (doc, meta) in enumerate(top_chunks, start=1):
+        labeled_chunks: List[Tuple[str, str, str, str]] = []
+        retained_scores: List[float] = []
+        for score, doc, meta, label, source in prepared_chunks:
+            # A label shared by different source documents cannot be verified
+            # safely. Do not rename it at query time: ingestion owns labels.
+            if label in ambiguous_labels:
+                continue
             meta_line = _build_metadata_line(meta)
-            source  = meta.get("source", "unknown source")
             source_text = str(meta.get("text") or doc or "")
-            # Choose the label before removing its duplicated heading: the
-            # heading is needed as a fallback when citation metadata is absent.
-            label = _doc_label(meta, i, source_text)
             raw_chunk = _strip_redundant_heading(source_text, label)
-            country = meta.get("country", "")
+            country = str(meta.get("country") or "")
             # Include meta_line in what the guardrail checks against, not
             # just raw_chunk — see PartialAnswer.labeled_chunks docstring.
             grounding_text = f"{meta_line}\n{raw_chunk}" if meta_line else raw_chunk
-            labeled_chunks.append((label, grounding_text, country))
+            labeled_chunks.append((label, grounding_text, country, source))
+            retained_scores.append(score)
             context_parts.append(
                 f"[{label}] {meta_line} | Source: {source}\n{raw_chunk}"
+            )
+
+        if not context_parts:
+            return PartialAnswer(
+                agent_id=self.description.agent_id,
+                agent_name=self.description.agent_id,
+                answer="No unambiguous, citable documents were found in this agent's knowledge base.",
+                labeled_chunks=[],
+                relevance_score=0.0,
             )
         context = "\n\n---\n\n".join(context_parts)
 
@@ -284,14 +370,10 @@ class SpecializedAgent:
         if ltm_context:
             user_content += f"\n\n{ltm_context}"
 
-        # Generate answer
-        # thinking=True: this is the citation-grounding-critical call, so on
-        # providers that support toggling reasoning (currently zai) we pay
-        # the extra latency for it; token_budget() compensates the max_tokens
-        # cap so the reasoning trace doesn't eat the whole budget itself.
+        # Generate a citation-grounded answer.
         response = self.llm_client.chat.completions.create(
             model=_MODELS["main"],
-            max_tokens=token_budget(1024, thinking=True),
+            max_tokens=1024,
             # Low, not zero: still needs to write fluent prose, but a high
             # default temperature gives the model more room to "fill gaps"
             # with plausible-sounding content not actually in the
@@ -299,7 +381,6 @@ class SpecializedAgent:
             # a case citation never retrieved this turn) — keeping it low
             # biases toward sticking to what's actually in the prompt.
             temperature=0.2,
-            **extra_kwargs(thinking=True),
             messages=[
                 {
                     "role": "system",
@@ -310,8 +391,9 @@ class SpecializedAgent:
                         f"  Doc types   : {', '.join(self.description.content_types)}\n\n"
                         "Answer using ONLY the provided context documents.\n"
                         "Each document below is preceded by its citation label in "
-                        "square brackets, e.g. [Art. 162] or [Court of Appeal of "
-                        "Salerno sec. II, 29/12/2022]. When you reference a document, "
+                        "square brackets, e.g. [Italy | Divorce | Art. 162] or "
+                        "[Italy | Divorce | Court of Appeal of Salerno sec. II, "
+                        "29/12/2022]. When you reference a document, "
                         "copy that exact bracketed label character-for-character — "
                         "never renumber it, never invent a label, never attribute a "
                         "claim to a label other than the one attached to the document "
@@ -357,11 +439,9 @@ class SpecializedAgent:
 
         answer_text = response.choices[0].message.content
 
-        # Relevance score: 1 - fraction of candidates kept after reranking
-        # (kept as before — Pinecone's own similarity scores aren't
-        # directly comparable across agents with different filters, so
-        # this proxy is used for ranking partial answers during aggregation).
-        relevance = round(1.0 - (len(top_chunks) / max(len(candidates), 1)), 3)
+        # Every agent uses the same cross-encoder, so its best reranker score
+        # is meaningful for ordering partial answers during aggregation.
+        relevance = round(max(retained_scores), 4)
 
         return PartialAnswer(
             agent_id=self.description.agent_id,
@@ -487,6 +567,67 @@ class SupervisorAgent:
 
     # ── Triage + Routing (single LLM call) ──────────────────────────────────
 
+    def _fallback_route(self, query: str) -> List[str]:
+        """Deterministic, bounded fallback when the router output is invalid.
+
+        It narrows agents using explicit country, legal-area and source-type
+        words in the question. With no usable signal it returns no agents
+        instead of launching the entire registry.
+        """
+        text = query.casefold()
+        country_terms = {
+            "Italy": ("italy", "italia", "italian", "italiano", "italiana"),
+            "Slovenia": ("slovenia", "slovenian", "sloveno", "slovena"),
+            "Estonia": ("estonia", "estonian", "estone", "estoni"),
+        }
+        area_terms = {
+            "Divorce": (
+                "divorce", "divorz", "separation", "separazione", "marriage",
+                "matrimonio", "spouse", "coniuge", "custody", "affidamento",
+            ),
+            "Inheritance": (
+                "inherit", "succession", "eredit", "successione", "will",
+                "testament", "heir", "erede", "legittima",
+            ),
+        }
+        case_terms = (
+            "case law", "giurisprud", "court", "tribunal", "cassazione",
+            "sentenza", "decisione giudiziaria",
+        )
+        law_terms = (
+            "article", "articolo", "statute", "legge", "codice", "provision",
+            "norma", "legislation", "legislazione",
+        )
+
+        countries = {
+            country
+            for country, terms in country_terms.items()
+            if any(term in text for term in terms)
+        }
+        areas = {
+            area
+            for area, terms in area_terms.items()
+            if any(term in text for term in terms)
+        }
+        wants_cases = any(term in text for term in case_terms)
+        wants_law = any(term in text for term in law_terms)
+
+        if not countries and not areas:
+            return []
+
+        selected = []
+        for desc in AGENT_REGISTRY:
+            if countries and not countries.intersection(desc.countries):
+                continue
+            if areas and not areas.intersection(desc.legal_areas):
+                continue
+            if wants_cases != wants_law:
+                wanted_type = "case" if wants_cases else "civil_code"
+                if wanted_type not in desc.content_types:
+                    continue
+            selected.append(desc.agent_id)
+        return selected
+
     def _triage_and_route(
         self, query: str, session_context: str
     ) -> Tuple[bool, Optional[str], List[str]]:
@@ -498,64 +639,96 @@ class SupervisorAgent:
 
         Returns (needs_retrieval, direct_answer, agent_ids)
         """
-        response = self.llm_client.chat.completions.create(
-            model=_MODELS["main"],
-            max_tokens=600,
-            # Deterministic structured output (JSON routing decision) —
-            # no reason to let sampling variance pick a different agent
-            # set for the same question from one run to the next.
-            temperature=0,
-            # thinking=False: cheap structured JSON decision, not worth the
-            # extra latency of a reasoning pass on providers that support it.
-            **extra_kwargs(thinking=False),
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are the routing layer of a multi-agent legal RAG system.\n\n"
-                        "When you receive a question:\n"
-                        "1. If it is general, conversational, or answerable from common knowledge "
-                        "→ set retrieval=false and provide a direct answer.\n"
-                        "2. If it requires searching specific cases, articles, or comparing "
-                        "countries in detail → set retrieval=true and select the right agents.\n\n"
-                        "Available agents:\n"
-                        f"{self._registry}\n\n"
-                        "Recent conversation context:\n"
-                        f"{session_context}\n\n"
-                        "Respond ONLY with valid JSON, no markdown fences:\n"
-                        "{\n"
-                        '  "retrieval": true or false,\n'
-                        '  "direct_answer": "..." (only if retrieval=false),\n'
-                        '  "selected_agents": ["id1", "id2"] (only if retrieval=true),\n'
-                        '  "reasoning": "..."\n'
-                        "}"
-                    ),
-                },
-                {"role": "user", "content": query},
-            ],
-        )
-
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-
         try:
+            response = self.llm_client.chat.completions.create(
+                model=_MODELS["main"],
+                max_tokens=600,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are the routing layer of a multi-agent legal RAG system.\n\n"
+                            "When you receive a question:\n"
+                            "1. If it is conversational or asks a stable, general fact that can "
+                            "be answered reliably without consulting the corpus (for example, "
+                            "when divorce was introduced in Italy), set retrieval=false and "
+                            "provide a direct answer.\n"
+                            "2. If it asks for current or detailed legal rules, exact articles, "
+                            "case law, source-backed analysis, or a comparison between countries, "
+                            "set retrieval=true and select the relevant agents.\n"
+                            "3. When uncertain whether a legal claim requires sources, prefer "
+                            "retrieval=true.\n\n"
+                            "Available agents:\n"
+                            f"{self._registry}\n\n"
+                            "Recent conversation context:\n"
+                            f"{session_context}\n\n"
+                            "Respond ONLY with valid JSON, no markdown fences:\n"
+                            "{\n"
+                            '  "retrieval": true or false,\n'
+                            '  "direct_answer": "..." (only if retrieval=false),\n'
+                            '  "selected_agents": ["id1", "id2"] (only if retrieval=true),\n'
+                            '  "reasoning": "..."\n'
+                            "}"
+                        ),
+                    },
+                    {"role": "user", "content": query},
+                ],
+            )
+
+            raw = response.choices[0].message.content.strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
             data = json.loads(raw)
-            needs_retrieval = data.get("retrieval", True)
-            direct_answer   = data.get("direct_answer", None)
-            selected        = data.get("selected_agents", [])
-            reasoning       = data.get("reasoning", "")
+            if not isinstance(data, dict):
+                raise ValueError("router response must be a JSON object")
+
+            needs_retrieval = data.get("retrieval")
+            if type(needs_retrieval) is not bool:
+                raise ValueError("'retrieval' must be a JSON boolean")
+
+            reasoning = data.get("reasoning", "")
+            if not isinstance(reasoning, str):
+                reasoning = ""
 
             print(f"\n[Supervisor] Retrieval: {needs_retrieval}")
             print(f"[Supervisor] Reasoning: {reasoning}")
 
-            # Validate agent IDs
-            valid_agents = [a for a in selected if a in self._agents]
-            return needs_retrieval, direct_answer, valid_agents
+            if not needs_retrieval:
+                direct_answer = data.get("direct_answer")
+                if not isinstance(direct_answer, str) or not direct_answer.strip():
+                    raise ValueError("direct route requires a non-empty 'direct_answer'")
+                return False, direct_answer.strip(), []
 
-        except json.JSONDecodeError:
-            print("[Supervisor] JSON parse failed, defaulting to full retrieval.")
-            return True, None, list(self._agents.keys())
+            selected = data.get("selected_agents")
+            if not isinstance(selected, list) or not all(
+                isinstance(agent_id, str) for agent_id in selected
+            ):
+                raise ValueError("'selected_agents' must be a list of strings")
+
+            valid_agents = list(dict.fromkeys(
+                agent_id for agent_id in selected if agent_id in self._agents
+            ))
+            if not valid_agents:
+                raise ValueError("router selected no valid agents")
+            return True, None, valid_agents
+
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError, IndexError) as exc:
+            fallback_agents = self._fallback_route(query)
+            logger.warning(
+                "Router response invalid (%s); deterministic fallback selected: %s",
+                exc,
+                fallback_agents,
+            )
+            return True, None, fallback_agents
+        except Exception as exc:
+            fallback_agents = self._fallback_route(query)
+            logger.warning(
+                "Router request failed (%s); deterministic fallback selected: %s",
+                exc,
+                fallback_agents,
+            )
+            return True, None, fallback_agents
 
     # ── Aggregation ──────────────────────────────────────────────────────────
 
@@ -594,8 +767,8 @@ class SupervisorAgent:
                 "well-structured response.\n"
                 "Highlight similarities and differences between jurisdictions.\n"
                 "Preserve all document references exactly as they appear in "
-                "the partial answers (e.g. [Art. 162], [Court of Appeal of "
-                "Salerno sec. II, 29/12/2022]) — do not renumber, merge, or "
+                "the partial answers (e.g. [Italy | Divorce | Art. 162]) — "
+                "do not shorten, renumber, merge, or "
                 "invent new labels.\n"
                 "Do not reveal the multi-agent architecture."
             )
@@ -609,19 +782,17 @@ class SupervisorAgent:
                 "Do not compare against, or mention, any other country's "
                 "law — none was retrieved for this question.\n"
                 "Preserve all document references exactly as they appear in "
-                "the partial answers (e.g. [Art. 162], [Court of Appeal of "
-                "Salerno sec. II, 29/12/2022]) — do not renumber, merge, or "
+                "the partial answers (e.g. [Italy | Divorce | Art. 162]) — "
+                "do not shorten, renumber, merge, or "
                 "invent new labels.\n"
                 "Do not reveal the multi-agent architecture."
             )
 
-        # thinking=True: synthesizing partial answers while preserving exact
-        # citation labels is another grounding-sensitive step.
+        # Synthesize partial answers while preserving exact citation labels.
         response = self.llm_client.chat.completions.create(
             model=_MODELS["main"],
-            max_tokens=token_budget(2048, thinking=True),
+            max_tokens=2048,
             temperature=0.2,
-            **extra_kwargs(thinking=True),
             messages=[
                 {
                     "role": "system",
@@ -710,7 +881,7 @@ class SupervisorAgent:
         Full pipeline:
         triage → (route → agents → aggregate) → guardrail → memory update
         """
-        print(f"\n{'─'*60}")
+        print(f"\n{'-'*60}")
         print(f"[Supervisor] Query: {query}")
 
         # Session context from short-term memory
@@ -750,7 +921,16 @@ class SupervisorAgent:
 
         # ── Retrieval path ───────────────────────────────────────────────────
         if not agent_ids:
-            return "Could not identify relevant agents for this question."
+            answer = (
+                "I could not identify a sufficiently specific jurisdiction or "
+                "legal area for retrieval. Please mention the country and whether "
+                "the question concerns divorce or inheritance."
+            )
+            turn = self.stm.add_turn(query, [], answer)
+            self.history.save_turn(
+                self.session_id, turn.turn_id, query, answer, []
+            )
+            return answer
 
         # Dispatch to selected agents, passing along relevant LTM background.
         # Recall is scoped to each agent individually (agent_id filter) so
@@ -761,18 +941,65 @@ class SupervisorAgent:
         # regimes, containing "[Art. 162]", was being recalled as
         # background for an unrelated Slovenia question and its citation
         # label got copied into the new answer).
-        partials: List[PartialAnswer] = []
-        for aid in agent_ids:
+        def _run_agent(aid: str) -> PartialAnswer:
             print(f"[{aid}] Generating partial answer ...")
             ltm_hits = self.ltm.recall_similar(query, n=2, agent_id=aid)
             if ltm_hits:
-                print(f"[Supervisor] Found {len(ltm_hits)} similar past Q&A in LTM for agent '{aid}'.")
+                print(
+                    f"[Supervisor] Found {len(ltm_hits)} similar past Q&A "
+                    f"in LTM for agent '{aid}'."
+                )
             ltm_context = self._format_ltm_context(ltm_hits)
-            pa = self._agents[aid].answer(query, ltm_context=ltm_context)
-            partials.append(pa)
+            return self._agents[aid].answer(query, ltm_context=ltm_context)
+
+        partials_by_agent: Dict[str, PartialAnswer] = {}
+        failed_agents: Dict[str, str] = {}
+        no_document_agents: List[str] = []
+        worker_count = min(MAX_PARALLEL_AGENTS, len(agent_ids))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_agent = {
+                executor.submit(_run_agent, aid): aid for aid in agent_ids
+            }
+            for future in as_completed(future_to_agent):
+                aid = future_to_agent[future]
+                try:
+                    partial = future.result()
+                    if partial.labeled_chunks:
+                        partials_by_agent[aid] = partial
+                    else:
+                        no_document_agents.append(aid)
+                except Exception as exc:
+                    failed_agents[aid] = str(exc)
+                    logger.exception("Agent %s failed", aid)
+
+        # Restore router order after futures complete so equal reranker scores
+        # and persisted agent lists remain deterministic.
+        partials = [
+            partials_by_agent[aid]
+            for aid in agent_ids
+            if aid in partials_by_agent
+        ]
+
+        if not partials:
+            if failed_agents:
+                answer = (
+                    "The relevant sources could not be consulted because of a "
+                    "temporary retrieval or generation error. Please try again."
+                )
+            else:
+                answer = "No relevant, unambiguous documents were found for this question."
+            turn = self.stm.add_turn(query, [], answer)
+            self.history.save_turn(
+                self.session_id, turn.turn_id, query, answer, []
+            )
+            return answer
 
         # Aggregate
-        final_answer = self._aggregate(query, partials)
+        try:
+            final_answer = self._aggregate(query, partials)
+        except Exception as exc:
+            logger.exception("Aggregation failed; returning successful partial answers")
+            final_answer = "\n\n".join(partial.answer for partial in partials)
 
         # Build a label -> source-text map across every agent's retrieved
         # chunks, so the output guardrail can look up the exact text behind
@@ -795,6 +1022,7 @@ class SupervisorAgent:
         # that share a label, instead of overwriting, keeps the full
         # document available for verification.
         chunk_by_label: Dict[str, str] = {}
+        label_source: Dict[str, str] = {}
         # label -> country, built alongside chunk_by_label so the guardrail
         # can scope its cross-reference heuristic by jurisdiction (see
         # _is_cross_referenced in guardrails/output_guard.py) instead of
@@ -808,7 +1036,27 @@ class SupervisorAgent:
         # country happened to be processed first.
         _ambiguous_country_labels: set = set()
         for p in partials:
-            for label, text, country in p.labeled_chunks:
+            for label, text, country, source in p.labeled_chunks:
+                if label in _ambiguous_country_labels:
+                    continue
+
+                previous_source = label_source.get(label)
+                if previous_source is not None and previous_source != source:
+                    # Never concatenate different documents behind one label:
+                    # doing so could make an incorrectly-attributed citation pass.
+                    chunk_by_label.pop(label, None)
+                    label_country.pop(label, None)
+                    _ambiguous_country_labels.add(label)
+                    logger.warning(
+                        "Citation label %r is shared by different sources (%s, %s); "
+                        "excluding it from grounding.",
+                        label,
+                        previous_source,
+                        source,
+                    )
+                    continue
+
+                label_source[label] = source
                 if label not in chunk_by_label:
                     chunk_by_label[label] = text
                 elif text not in chunk_by_label[label]:
@@ -823,14 +1071,31 @@ class SupervisorAgent:
 
         # Output guardrail — verifies each citation individually against
         # its own source, not the answer as a whole against everything.
-        final_answer = check_grounding(
-            final_answer, chunk_by_label, self.llm_client, label_country=label_country
-        )
+        try:
+            final_answer = check_grounding(
+                final_answer,
+                chunk_by_label,
+                self.llm_client,
+                label_country=label_country,
+            )
+        except Exception:
+            logger.exception("Output guardrail failed unexpectedly")
+            final_answer = (
+                "[NOTE: citation verification could not be completed due to a "
+                "temporary error.]\n\n" + final_answer
+            )
+
+        if failed_agents or no_document_agents:
+            final_answer = (
+                "[NOTE: some relevant sources could not be consulted; the answer "
+                "uses only the sources retrieved successfully.]\n\n" + final_answer
+            )
 
         # Update memory
+        successful_agent_ids = [partial.agent_id for partial in partials]
         turn = self.stm.add_turn(
             query=query,
-            agents_activated=agent_ids,
+            agents_activated=successful_agent_ids,
             answer=final_answer,
         )
         self.history.save_turn(
@@ -838,19 +1103,19 @@ class SupervisorAgent:
             turn_id=turn.turn_id,
             query=query,
             answer=final_answer,
-            agents_activated=agent_ids,
+            agents_activated=successful_agent_ids,
         )
         # Runs in the background — the user gets final_answer immediately,
         # the summary LLM call for LTM happens after the fact.
         countries_used = sorted({
             country
-            for aid in agent_ids
+            for aid in successful_agent_ids
             for country in self._agents[aid].description.countries
         })
         self._store_in_ltm_background(
             query=query,
             answer=final_answer,
-            agents_used=agent_ids,
+            agents_used=successful_agent_ids,
             countries_used=countries_used,
         )
 

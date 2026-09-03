@@ -91,6 +91,7 @@ class ChatHistoryStore:
     def _connect(self):
         conn = sqlite3.connect(self._path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
             yield conn
             conn.commit()
@@ -248,6 +249,12 @@ class ChatHistoryStore:
         user clicks a session in the sidebar to reload it verbatim.
         """
         with self._lock, self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if exists is None:
+                raise ValueError(f"Unknown chat session: {session_id}")
             rows = conn.execute(
                 "SELECT turn_id, query, answer, agents_activated, timestamp "
                 "FROM turns WHERE session_id = ? ORDER BY turn_id ASC",

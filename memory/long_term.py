@@ -27,7 +27,7 @@ import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 
-from llm_client import get_llm_client, model_names, extra_kwargs
+from llm_client import get_llm_client, model_names
 
 
 # ---------------------------------------------------------------------------
@@ -318,13 +318,10 @@ class LongTermMemory:
         """
         jurisdictions = ", ".join(countries_used) or "not specified"
         try:
-            # thinking=False: cheap high-volume summarization, not worth the
-            # extra latency of a reasoning pass.
             response = self._llm.chat.completions.create(
                 model=self._light_model,
                 max_tokens=500,
                 temperature=0.2,
-                **extra_kwargs(thinking=False),
                 messages=[{
                     "role": "user",
                     "content": (

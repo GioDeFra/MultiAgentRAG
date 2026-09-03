@@ -44,7 +44,7 @@ from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from llm_client import get_llm_client, model_names, extra_kwargs, token_budget
+from llm_client import get_llm_client, model_names
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +92,17 @@ CITATION_PATTERN = re.compile(r"\[([^\[\]]+)\]")
 # formatting instructions with 100% reliability, so this is a backstop,
 # not a replacement for the prompt-side fix in agents.py.
 _MALFORMED_CITATION = re.compile(
-    r"\[Art\.\s*(?:Article|ARTICLE)\s+(\d+[a-zA-Z\-]*)\]", re.IGNORECASE
+    r"\[(?P<prefix>[^\[\]]*?\|\s*)?Art\.\s*(?:Article|ARTICLE)\s+"
+    r"(?P<number>\d+[a-zA-Z\-]*)\]",
+    re.IGNORECASE,
 )
 
 
 def _normalize_malformed_citations(answer: str) -> str:
-    return _MALFORMED_CITATION.sub(lambda m: f"[Art. {m.group(1)}]", answer)
+    return _MALFORMED_CITATION.sub(
+        lambda m: f"[{m.group('prefix') or ''}Art. {m.group('number')}]",
+        answer,
+    )
 
 # Splits on sentence-ending punctuation followed by whitespace and then
 # either a capital letter or an opening bracket (citations often sit right
@@ -163,7 +168,10 @@ def _citations_in(sentence: str) -> List[str]:
 # in the answer is untouched, only the guardrail's internal matching gets
 # the fallback.
 _SUBSECTION_SUFFIX = re.compile(
-    r"^(Art\.?\s*\d+[a-zA-Z\-]*)\s*\(\s*\d+[a-zA-Z]*\s*\)$", re.IGNORECASE
+    r"^(?P<prefix>[^\[\]]*?\|\s*)?"
+    r"(?P<article>Art\.?\s*\d+[a-zA-Z\-]*)\s*"
+    r"\(\s*\d+[a-zA-Z]*\s*\)$",
+    re.IGNORECASE,
 )
 
 
@@ -171,7 +179,7 @@ def _base_article_label(label: str) -> Optional[str]:
     """"Art. 15(1)" -> "Art. 15" for lookup purposes; None if `label`
     doesn't have a trailing subsection reference to strip."""
     m = _SUBSECTION_SUFFIX.match(label.strip())
-    return m.group(1) if m else None
+    return f"{m.group('prefix') or ''}{m.group('article')}" if m else None
 
 
 def _label_core(label: str) -> str:
@@ -190,7 +198,8 @@ def _label_core(label: str) -> str:
 # text only makes sense for article numbers, never for a case citation's
 # incidental digits.
 _ARTICLE_LABEL = re.compile(
-    r"^Art(?:icle)?\.?\s*\d+[a-zA-Z\-]*(?:\s*,\s*Art(?:icle)?\.?\s*\d+[a-zA-Z\-]*)*$",
+    r"^(?:[^\[\]]*?\|\s*)?Art(?:icle)?\.?\s*\d+[a-zA-Z\-]*"
+    r"(?:\s*,\s*Art(?:icle)?\.?\s*\d+[a-zA-Z\-]*)*$",
     re.IGNORECASE,
 )
 
@@ -343,16 +352,11 @@ def _check_single_citation(
             f"do not judge this as a whole):\n{full_answer}\n\n"
             if full_answer else ""
         )
-        # thinking=True: this IS the reasoning task (does this source support
-        # this claim, yes/no) — the one place where a deliberate reasoning
-        # pass should help most. token_budget compensates max_tokens since
-        # the visible answer is just "YES"/"NO" but the reasoning trace
-        # leading to it needs real headroom.
+        # The visible verdict is deliberately limited to YES/NO.
         response = llm_client.chat.completions.create(
             model=CHECK_MODEL,
-            max_tokens=token_budget(10, thinking=True),
+            max_tokens=10,
             temperature=0,
-            **extra_kwargs(thinking=True),
             messages=[
                 {
                     "role": "user",
@@ -439,9 +443,8 @@ def _rewrite_with_grounding_feedback(
     try:
         response = llm_client.chat.completions.create(
             model=CORRECTION_MODEL,
-            max_tokens=token_budget(2048, thinking=True),
+            max_tokens=2048,
             temperature=0,
-            **extra_kwargs(thinking=True),
             messages=[{
                 "role": "user",
                 "content": (

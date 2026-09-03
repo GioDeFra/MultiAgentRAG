@@ -79,6 +79,10 @@ class ShortTermMemory:
             lines.append(f"A: {turn.answer}")
         return "\n".join(lines)
 
+    def __len__(self) -> int:
+        """Return the number of turns currently retained in memory."""
+        return len(self._turns)
+
     def reset(self) -> None:
         """Clear the in-memory window and restart the session turn counter."""
         self._turns.clear()

@@ -1,0 +1,42 @@
+[
+  {
+    "question": "In Estonia, while still married under a joint property regime, can I sell 'my half' of the marital assets or force a division?",
+    "reference": "No. Under section 26(1) of Estonia's Family Law Act, a spouse cannot dispose of an individual share of joint property or demand division while jointness continues. This concerns the property regime, not merely marital status. Judicial termination is governed by section 36; an agreed regime change by section 59. Division follows termination under section 37, and the division claim may accompany the termination action."
+  },
+  {
+    "question": "My spouse and I want to change our matrimonial property regime in Italy. What does the agreement need and when does it bind third parties?",
+    "reference": "In Italy, a matrimonial property agreement must take the form of a public deed, otherwise it is void (Civil Code Article 162). Spouses may enter such agreements during marriage. Opposability to third parties requires the prescribed annotation in the margin of the marriage record. Land-register transcription is a distinct requirement for transactions affecting relevant immovable property rights; it does not replace marriage-record annotation. Whether additional registration is needed depends on the agreement and assets concerned."
+  },
+  {
+    "question": "In Estonia, if I am entitled to a compulsory portion (forced heirship), how large is it and what do I actually receive?",
+    "reference": "Under sections 104 and 105 of Estonia's Law of Succession Act, the compulsory portion is a monetary claim against the successors, equal to half the value of the intestate share calculated under section 105. It does not automatically confer ownership of particular estate assets. Eligibility requires more than kinship or marriage: the deceased must have owed the claimant a statutory maintenance obligation at death, and the claimant's entitlement must have been excluded or reduced by a will or succession contract. The statutory priority rules also apply."
+  },
+  {
+    "question": "If inherited real estate cannot be divided conventionally among heirs, can the court order a public auction and split the proceeds?",
+    "reference": "The answer depends on the applicable jurisdiction. In Estonia, section 77(2) of the Law of Property Act permits the court, where co-owners cannot agree, to order physical division, allocation to one or more co-owners with monetary compensation, or sale by public auction or auction among co-owners, with proceeds divided according to shares. In Italy, Civil Code Article 720 prefers allocation of an indivisible inherited immovable to an eligible requesting heir or jointly requesting heirs, with equalisation; sale is the fallback if no co-heir is willing to take it. Article 721 addresses the sale arrangements. An auction is possible, but disagreement does not make it automatic."
+  },
+  {
+    "question": "I am married under a community/joint property regime. Can I sell or gift my 'share' of the marital property while still married — comparing Estonia vs Slovenia?",
+    "reference": "Estonia: Family Law Act section 26(1) prohibits disposing of an individual share while jointness continues. Slovenia: Family Code Article 68 provides that spouses' shares in joint property are undetermined and prohibits inter vivos disposal or encumbrance of an undetermined share. Joint disposal of an asset is different from selling a supposed individual half. Slovenian Article 71 allows division during marriage by agreement or at one spouse's request; divorce is not always necessary before division."
+  },
+  {
+    "question": "My siblings and I inherited an apartment in Italy, but it cannot be conveniently divided. What does the Civil Code say should happen and do courts actually proceed with an auction sale?",
+    "reference": "Civil Code Article 720 provides for preferential allocation of an inherited immovable that cannot conveniently be divided to a co-heir entitled to the larger share, or to several co-heirs requesting joint allocation, with the excess value charged to their allocation. If no co-heir is willing to take it, sale by auction follows; Article 721 governs sale arrangements. Equal shares do not, under Article 720 itself, require allocation of the whole apartment by drawing lots. The Italian Constitutional Court's judgment 90/2019 describes judicial sale in partition proceedings as a fallback when convenient division and allocation cannot resolve the matter. This supports the availability of judicial sale, without establishing how frequently auctions occur."
+  },
+  {
+    "question": "In Slovenia, when can a spouse request judicial separation of assets? What are the legal triggers and what can a court practically order in a real dispute?",
+    "reference": "Slovenian Family Code Article 71 allows joint property to be divided during marriage by agreement or at one spouse's request. Mismanagement, insolvency and prolonged separation are not an exhaustive set of prerequisites for this division. Debts and claims relating to joint property are established before shares are determined (Article 72). If spouses disagree, the court determines shares; Article 74 presumes equal shares but permits proof of different contributions, including non-financial contributions. If division arrangements cannot be agreed, the court applies the relevant division rules. Division of existing property should not be equated automatically with adoption of a separate-property regime for future acquisitions."
+  },
+  {
+    "question": "In civil law, what is the difference between a void contract and a voidable contract, and what are the consequences of each?",
+    "reference": "The terminology and remedies depend on the jurisdiction. Broadly, a void transaction lacks legal validity, whereas a voidable transaction can be defeated by the entitled party through the applicable avoidance procedure. German Civil Code section 142 treats an avoided transaction as void from the outset. French Civil Code Articles 1178-1182 distinguish absolute nullity, protecting the general interest, from relative nullity, protecting a private interest; standing and confirmation differ accordingly. Annulment can lead to restitution, subject to applicable rules. It is inaccurate to treat these national categories as identical or to state universal rules on judicial intervention, limitation periods or incapacity without specifying the country."
+  },
+  {
+    "question": "In civil law, what must be proven to establish non-contractual (tort) liability for negligence?",
+    "reference": "There is no single negligence test or burden-of-proof rule for every civil-law jurisdiction. Generally, the analysis concerns negligent conduct, legally compensable harm, and a legally sufficient causal connection, together with the applicable requirements of unlawfulness or infringement of a protected interest. For example, German Civil Code section 823(1) covers unlawful intentional or negligent injury to specified protected rights, while section 823(2) addresses breach of a protective statute. Section 276(2) defines negligence by reference to the care required in the relevant dealings. The applicable country, cause of action and any statutory presumptions must be identified before specifying what each party must prove."
+  },
+  {
+    "question": "In Estonia, if spouses have a claim owned jointly (e.g., a receivable), can it be set off during the property division dispute, and how does a court net the amount in practice?",
+    "reference": "Under Estonian Family Law Act section 26(2), a jointly owned claim may be set off only against a claim that is payable from joint property by law or agreement. Joint ownership of the receivable alone does not permit unrestricted set-off. Sections 37 and 38 govern division of joint property and its obligations. Allocation and any balancing payment require the particular assets, debts and applicable division rules to be established; a balancing payment is not automatically the same as legal set-off. A specific court calculation requires the facts and, for a case-law example, an identified judgment."
+  }
+]

@@ -14,3 +14,6 @@ chat_history-db/
 
 chat_history.json
 chat_history.json.tmp
+
+chat_history.db
+

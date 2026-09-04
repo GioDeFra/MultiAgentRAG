@@ -2,13 +2,10 @@ Apikey.env
 
 Contest_Data/
 
-_pycache__/
+__pycache__/
+*.py[cod]
 
 chroma_db/
-
-guardrails/_pycache__
-
-memory/_pycache__
 
 chat_history-db/
 
@@ -16,4 +13,3 @@ chat_history.json
 chat_history.json.tmp
 
 chat_history.db
-

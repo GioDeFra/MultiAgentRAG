@@ -73,15 +73,6 @@ _PROVIDERS = {
             "light": "gemini-3.1-flash-lite",
         },
     },
-    "zai": {
-        "base_url": "https://api.z.ai/api/paas/v4/",
-        "api_key_env": "ZAI_API_KEY",
-        "models": {
-            "main": "glm-4.5-flash",
-            "check": "glm-4.5-flash",
-            "light": "glm-4.5-flash",
-        },
-    },
 }
 
 

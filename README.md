@@ -7,6 +7,9 @@ MultiAgentRAG is a multi-agent retrieval-augmented generation system for answeri
 ## Features
 
 - LLM-based triage between direct responses and document retrieval
+- Country clarification before retrieval when the user has not selected a jurisdiction
+- Context-aware follow-ups: country-only replies resume the pending legal question
+- General LLM answers for countries outside the corpus, explicitly marked as not RAG-backed
 - Eleven specialist agents covering legislation and case law across three jurisdictions
 - Metadata-filtered semantic retrieval from a shared Pinecone index
 - BGE-M3 embeddings and cross-encoder reranking
@@ -57,6 +60,7 @@ All specialist agents query the same `legal-rag` Pinecone index. The registry in
 | `ui.py` | Local Gradio chat interface and application entry point |
 | `agents.py` | Supervisor, specialist-agent retrieval, reranking, aggregation, and memory coordination |
 | `config.py` | Specialist-agent registry and Pinecone metadata filters |
+| `routing.py` | Country selection, clarification, standalone follow-up questions, and external-country LLM answers |
 | `llm_client.py` | LLM provider selection and provider-specific model configuration |
 | `guardrails/output_guard.py` | Per-citation support verification and answer correction |
 | `memory/short_term.py` | Ten-turn in-memory sliding window |
@@ -162,6 +166,21 @@ The first launch may take time while the embedding and reranking models are down
 The interface is intentionally local-only (`share=False`). A public deployment would require per-user state isolation, authentication, secret management, and production hardening.
 
 ## Agent coverage
+
+The router asks which country or countries the user means when a legal question
+has no jurisdiction. It does not select all three countries by default. A related
+follow-up can inherit an explicit user choice; countries merely listed by the
+assistant are not treated as a selection. Replies such as `Italia e Slovenia` or
+`Tutti e tre` after clarification resume the original legal question.
+
+Italy, Slovenia and Estonia use corpus retrieval. Other countries use a separate
+general LLM response, labelled as not backed by RAG sources. Mixed requests (for
+example Italy and France) show the retrieved answer and the model-only answer
+separately. The model-only section is neither checked against another country's
+sources nor saved to retrieval-backed long-term memory.
+
+Run `python scripts/validate_routing.py` to exercise country selection and follow-ups
+with real calls to the configured provider. The report is saved under `ragas_results/`.
 
 | Jurisdiction | Divorce | Inheritance |
 | --- | --- | --- |

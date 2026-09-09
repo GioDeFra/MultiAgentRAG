@@ -83,6 +83,15 @@ class ShortTermMemory:
         """Return the number of turns currently retained in memory."""
         return len(self._turns)
 
+    def as_routing_context(self, n_turns: int = 3) -> List[dict]:
+        """Keep user choices distinct from assistant suggestions and source cards."""
+        if n_turns < 1:
+            raise ValueError("n_turns must be at least 1")
+        return [
+            {"query": turn.query, "answer": turn.answer.split("\n\n---\n\n### Sources used", 1)[0]}
+            for turn in list(self._turns)[-n_turns:]
+        ]
+
     def reset(self) -> None:
         """Clear the in-memory window and restart the session turn counter."""
         self._turns.clear()

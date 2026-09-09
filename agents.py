@@ -15,7 +15,6 @@ SupervisorAgent
     and runs the output guardrail. Also manages short-term, long-term,
     and chat-history memory.
 """
-import json
 import logging
 import os
 import re
@@ -39,12 +38,13 @@ from openai import OpenAI
 from pinecone import Pinecone
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
-from config import AGENT_MAP, AGENT_REGISTRY, AgentDescription
+from config import AGENT_REGISTRY, AgentDescription
 from guardrails.output_guard import check_grounding
 from llm_client import get_llm_client, model_names
 from memory.chat_history import ChatHistoryStore
 from memory.long_term import LongTermMemory
 from memory.short_term import ShortTermMemory, Turn
+from routing import JurisdictionRouter, RouteDecision
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +463,9 @@ class SpecializedAgent:
                         f"  Legal areas : {', '.join(self.description.legal_areas)}\n"
                         f"  Doc types   : {', '.join(self.description.content_types)}\n\n"
                         "Answer using ONLY the provided context documents.\n"
+                        "Answer ONLY for the countries listed in your specialist coverage. "
+                        "If the question also names other countries, leave those parts to "
+                        "the other answer paths; do not infer their rules.\n"
                         "Each document below is preceded by its citation label in "
                         "square brackets, e.g. [Italy | Divorce | Art. 162] or "
                         "[Italy | Divorce | Court of Appeal of Salerno sec. II, "
@@ -595,23 +598,6 @@ class SupervisorAgent:
             for desc in AGENT_REGISTRY
         }
 
-        # Pre-render agent registry for routing prompt
-        self._registry = self._build_registry()
-
-    # ── Registry description ─────────────────────────────────────────────────
-
-    def _build_registry(self) -> str:
-        lines = []
-        for desc in AGENT_REGISTRY:
-            lines.append(
-                f"- agent_id: {desc.agent_id}\n"
-                f"  covers  : {', '.join(desc.countries)} | "
-                f"{', '.join(desc.legal_areas)} | "
-                f"{', '.join(desc.content_types)}\n"
-                f"  summary : {desc.description}"
-            )
-        return "\n\n".join(lines)
-
     # ── LTM context formatting ───────────────────────────────────────────────
 
     @staticmethod
@@ -641,168 +627,11 @@ class SupervisorAgent:
 
     # ── Triage + Routing (single LLM call) ──────────────────────────────────
 
-    def _fallback_route(self, query: str) -> List[str]:
-        """Deterministic, bounded fallback when the router output is invalid.
-
-        It narrows agents using explicit country, legal-area and source-type
-        words in the question. With no usable signal it returns no agents
-        instead of launching the entire registry.
-        """
-        text = query.casefold()
-        country_terms = {
-            "Italy": ("italy", "italia", "italian", "italiano", "italiana"),
-            "Slovenia": ("slovenia", "slovenian", "sloveno", "slovena"),
-            "Estonia": ("estonia", "estonian", "estone", "estoni"),
-        }
-        area_terms = {
-            "Divorce": (
-                "divorce", "divorz", "separation", "separazione", "marriage",
-                "matrimonio", "spouse", "coniuge", "custody", "affidamento",
-            ),
-            "Inheritance": (
-                "inherit", "succession", "eredit", "successione", "will",
-                "testament", "heir", "erede", "legittima",
-            ),
-        }
-        case_terms = (
-            "case law", "giurisprud", "court", "tribunal", "cassazione",
-            "sentenza", "decisione giudiziaria",
-        )
-        law_terms = (
-            "article", "articolo", "statute", "legge", "codice", "provision",
-            "norma", "legislation", "legislazione",
-        )
-
-        countries = {
-            country
-            for country, terms in country_terms.items()
-            if any(term in text for term in terms)
-        }
-        areas = {
-            area
-            for area, terms in area_terms.items()
-            if any(term in text for term in terms)
-        }
-        wants_cases = any(term in text for term in case_terms)
-        wants_law = any(term in text for term in law_terms)
-
-        if not countries and not areas:
-            return []
-
-        selected = []
-        for desc in AGENT_REGISTRY:
-            if countries and not countries.intersection(desc.countries):
-                continue
-            if areas and not areas.intersection(desc.legal_areas):
-                continue
-            if wants_cases != wants_law:
-                wanted_type = "case" if wants_cases else "civil_code"
-                if wanted_type not in desc.content_types:
-                    continue
-            selected.append(desc.agent_id)
-        return selected
-
     def _triage_and_route(
-        self, query: str, session_context: str
-    ) -> Tuple[bool, Optional[str], List[str]]:
-        """
-        Single LLM call that decides:
-          - retrieval: true/false
-          - direct_answer: if retrieval=false, the answer itself
-          - selected_agents: if retrieval=true, which agents to activate
-
-        Returns (needs_retrieval, direct_answer, agent_ids)
-        """
-        try:
-            response = self.llm_client.chat.completions.create(
-                model=_MODELS["main"],
-                max_tokens=600,
-                temperature=0,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are the routing layer of a multi-agent legal RAG system.\n\n"
-                            "When you receive a question:\n"
-                            "1. If it is conversational or asks a stable, general fact that can "
-                            "be answered reliably without consulting the corpus (for example, "
-                            "when divorce was introduced in Italy), set retrieval=false and "
-                            "provide a direct answer.\n"
-                            "2. If it asks for current or detailed legal rules, exact articles, "
-                            "case law, source-backed analysis, or a comparison between countries, "
-                            "set retrieval=true and select the relevant agents.\n"
-                            "3. When uncertain whether a legal claim requires sources, prefer "
-                            "retrieval=true.\n\n"
-                            "Available agents:\n"
-                            f"{self._registry}\n\n"
-                            "Recent conversation context:\n"
-                            f"{session_context}\n\n"
-                            "Respond ONLY with valid JSON, no markdown fences:\n"
-                            "{\n"
-                            '  "retrieval": true or false,\n'
-                            '  "direct_answer": "..." (only if retrieval=false),\n'
-                            '  "selected_agents": ["id1", "id2"] (only if retrieval=true),\n'
-                            '  "reasoning": "..."\n'
-                            "}"
-                        ),
-                    },
-                    {"role": "user", "content": query},
-                ],
-            )
-
-            raw = response.choices[0].message.content.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                raise ValueError("router response must be a JSON object")
-
-            needs_retrieval = data.get("retrieval")
-            if type(needs_retrieval) is not bool:
-                raise ValueError("'retrieval' must be a JSON boolean")
-
-            reasoning = data.get("reasoning", "")
-            if not isinstance(reasoning, str):
-                reasoning = ""
-
-            print(f"\n[Supervisor] Retrieval: {needs_retrieval}")
-            print(f"[Supervisor] Reasoning: {reasoning}")
-
-            if not needs_retrieval:
-                direct_answer = data.get("direct_answer")
-                if not isinstance(direct_answer, str) or not direct_answer.strip():
-                    raise ValueError("direct route requires a non-empty 'direct_answer'")
-                return False, direct_answer.strip(), []
-
-            selected = data.get("selected_agents")
-            if not isinstance(selected, list) or not all(
-                isinstance(agent_id, str) for agent_id in selected
-            ):
-                raise ValueError("'selected_agents' must be a list of strings")
-
-            valid_agents = list(dict.fromkeys(
-                agent_id for agent_id in selected if agent_id in self._agents
-            ))
-            if not valid_agents:
-                raise ValueError("router selected no valid agents")
-            return True, None, valid_agents
-
-        except (json.JSONDecodeError, TypeError, ValueError, AttributeError, IndexError) as exc:
-            fallback_agents = self._fallback_route(query)
-            logger.warning(
-                "Router response invalid (%s); deterministic fallback selected: %s",
-                exc,
-                fallback_agents,
-            )
-            return True, None, fallback_agents
-        except Exception as exc:
-            fallback_agents = self._fallback_route(query)
-            logger.warning(
-                "Router request failed (%s); deterministic fallback selected: %s",
-                exc,
-                fallback_agents,
-            )
-            return True, None, fallback_agents
+        self, query: str, session_context: List[dict]
+    ) -> RouteDecision:
+        """Resolve the user's country choice before activating any specialist."""
+        return JurisdictionRouter(self.llm_client, _MODELS["main"]).route(query, session_context)
 
     # ── Aggregation ──────────────────────────────────────────────────────────
 
@@ -959,7 +788,7 @@ class SupervisorAgent:
         print(f"[Supervisor] Query: {query}")
 
         # Session context from short-term memory
-        session_context = self.stm.as_context_string(n_turns=3)
+        session_context = self.stm.as_routing_context(n_turns=3)
 
         # NOTE: long-term memory recall happens per-agent, below, once we
         # know which agent(s) are handling this query — see the retrieval
@@ -967,14 +796,32 @@ class SupervisorAgent:
         # triage/routing prompt.
 
         # Triage + routing
-        needs_retrieval, direct_answer, agent_ids = self._triage_and_route(
-            query, session_context
-        )
+        route = self._triage_and_route(query, session_context)
+        agent_ids = route.agent_ids
+        resolved_query = route.query
+        direct_answer = route.direct_answer
+        external_answer = ""
+        if route.external_countries:
+            try:
+                external_answer = JurisdictionRouter(
+                    self.llm_client, _MODELS["main"]
+                ).answer_external(route)
+            except Exception as exc:
+                logger.warning("External-country answer unavailable (%s)", type(exc).__name__)
+                countries = ", ".join(route.external_countries)
+                external_answer = (
+                    f"Non ho potuto generare la risposta LLM per {countries}. Riprova."
+                    if route.language.startswith("it") else
+                    f"I could not generate the LLM answer for {countries}. Please try again."
+                )
+            if not agent_ids:
+                direct_answer = external_answer
 
         # ── Direct answer path ───────────────────────────────────────────────
-        if not needs_retrieval and direct_answer:
+        if not agent_ids and direct_answer:
             print("[Supervisor] Answering directly (no retrieval needed).")
-            direct_answer += _source_appendix([])
+            if not route.clarification:
+                direct_answer += _source_appendix([])
             turn = self.stm.add_turn(
                 query=query,
                 agents_activated=[],
@@ -1018,14 +865,14 @@ class SupervisorAgent:
         # label got copied into the new answer).
         def _run_agent(aid: str) -> PartialAnswer:
             print(f"[{aid}] Generating partial answer ...")
-            ltm_hits = self.ltm.recall_similar(query, n=2, agent_id=aid)
+            ltm_hits = self.ltm.recall_similar(resolved_query, n=2, agent_id=aid)
             if ltm_hits:
                 print(
                     f"[Supervisor] Found {len(ltm_hits)} similar past Q&A "
                     f"in LTM for agent '{aid}'."
                 )
             ltm_context = self._format_ltm_context(ltm_hits)
-            return self._agents[aid].answer(query, ltm_context=ltm_context)
+            return self._agents[aid].answer(resolved_query, ltm_context=ltm_context)
 
         partials_by_agent: Dict[str, PartialAnswer] = {}
         failed_agents: Dict[str, str] = {}
@@ -1064,6 +911,8 @@ class SupervisorAgent:
             else:
                 answer = "No relevant, unambiguous documents were found for this question."
             answer += _source_appendix([])
+            if external_answer:
+                answer += "\n\n---\n\n" + external_answer
             turn = self.stm.add_turn(query, [], answer)
             self.history.save_turn(
                 self.session_id, turn.turn_id, query, answer, []
@@ -1072,7 +921,7 @@ class SupervisorAgent:
 
         # Aggregate
         try:
-            final_answer = self._aggregate(query, partials)
+            final_answer = self._aggregate(resolved_query, partials)
         except Exception as exc:
             logger.exception("Aggregation failed; returning successful partial answers")
             final_answer = "\n\n".join(partial.answer for partial in partials)
@@ -1175,6 +1024,10 @@ class SupervisorAgent:
             for document in partial.retrieved_documents
         ])
         display_answer = final_answer + _source_appendix(retrieved_documents)
+        # Model-only answers are not verified against another country's corpus,
+        # and never enter the retrieval-backed long-term memory below.
+        if external_answer:
+            display_answer += "\n\n---\n\n" + external_answer
         turn = self.stm.add_turn(
             query=query,
             agents_activated=successful_agent_ids,
@@ -1196,7 +1049,7 @@ class SupervisorAgent:
             for country in self._agents[aid].description.countries
         })
         self._store_in_ltm_background(
-            query=query,
+            query=resolved_query,
             answer=final_answer,
             agents_used=successful_agent_ids,
             countries_used=countries_used,

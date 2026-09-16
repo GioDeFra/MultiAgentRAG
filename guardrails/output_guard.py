@@ -43,7 +43,7 @@ CORRECTION_MODEL = model_names()["main"]
 # Citation checks run one LLM call each, so this caps worst-case latency
 # and cost on answers with many citations (mirrors the old code's
 # `retrieved_chunks[:6]` cap, applied per-citation instead of per-answer).
-MAX_CITATIONS_TO_CHECK = 10
+MAX_CITATIONS_TO_CHECK = 40
 
 # Prevent a correction request from growing without bound when many large
 # retrieved chunks are available. The most useful context is kept in the same

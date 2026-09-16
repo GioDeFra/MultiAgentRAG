@@ -166,13 +166,18 @@ class JurisdictionRouter:
         if not isinstance(data, dict):
             raise ValueError("Routing response must be an object")
         query, language = data.get("query"), data.get("language")
+        status = data.get("jurisdiction")
+        # Direct replies and clarification questions need no rewritten legal query.
+        if status in {"missing", "not_needed"} and (
+            query is None or (isinstance(query, str) and not query.strip())
+        ):
+            query = user_turns[-1]
         if (
             not isinstance(query, str)
             or not query.strip()
             or not isinstance(language, str)
         ):
             raise ValueError("Missing resolved question or language")
-        status = data.get("jurisdiction")
         if status in {"missing", "not_needed"}:
             answer = data.get("direct_answer")
             if not isinstance(answer, str) or not answer.strip():

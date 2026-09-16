@@ -1,39 +1,7 @@
-"""
-guardrails/output_guard.py — Per-citation output grounding check.
+"""Check cited claims against the text associated with each citation label.
 
-After the agents generate an answer, this module verifies that each
-individual "[label]" citation in the answer is actually supported by the
-specific source text behind that label — not just that the answer as a
-whole is "plausible" given the union of everything retrieved.
-
-Previous version (whole-answer check)
---------------------------------------
-The original implementation compared the full answer against the top 6
-retrieved chunks concatenated together, in one LLM call, for one binary
-GROUNDED / NOT_GROUNDED verdict. That is structurally blind to citation
-*attribution* errors: if the true fact ("a public deed is required") is
-present *somewhere* in the combined context, the whole-answer check
-passes even when the answer attached that fact to the wrong label (e.g.
-"[Art. 159]" instead of "[Art. 162]"). The content is grounded; the
-citation is not — and the old check had no way to tell the difference.
-
-This version
-------------
-1. Parse the answer into sentences and find every "[label]" citation.
-2. For each (sentence, label) pair:
-   - if `label` isn't in the supplied label -> source-text map at all,
-     flag it immediately as an unknown/invented citation (no LLM call
-     needed — this is a pure lookup failure);
-   - otherwise, ask a small/fast model whether that *specific* source
-     text supports that *specific* sentence (not the whole answer).
-3. Only the citations that fail (or whose source is missing) get a
-   warning; citations that pass are left alone. This is a much more
-   precise signal than a single pass/fail verdict over everything.
-
-This is still a secondary safety net, not the primary answer path: any
-failure (LLM API timeout, rate limit, unparseable response, regex edge case)
-must never crash the pipeline. Failures degrade to a neutral notice
-rather than raising, exactly like before.
+Unknown labels and unsupported claims receive warnings. Model failures produce
+a verification notice so the answer pipeline can continue.
 """
 
 import logging
@@ -44,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from llm_client import get_llm_client, model_names
+from llm_client import get_llm_client, model_names, output_token_limit
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +72,7 @@ def _normalize_malformed_citations(answer: str) -> str:
         answer,
     )
 
+
 # Splits on sentence-ending punctuation followed by whitespace and then
 # either a capital letter or an opening bracket (citations often sit right
 # at the end of a sentence, e.g. "...atto pubblico [Art. 162]."). This is
@@ -142,6 +111,7 @@ _CITATION_ONLY = re.compile(r"^(?:\[[^\[\]]+\]\s*,?\s*)+$")
 # PARSING HELPERS
 # ---------------------------------------------------------------------------
 
+
 def _split_sentences(text: str) -> List[str]:
     raw = [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
     merged: List[str] = []
@@ -176,7 +146,7 @@ _SUBSECTION_SUFFIX = re.compile(
 
 
 def _base_article_label(label: str) -> Optional[str]:
-    """"Art. 15(1)" -> "Art. 15" for lookup purposes; None if `label`
+    """ "Art. 15(1)" -> "Art. 15" for lookup purposes; None if `label`
     doesn't have a trailing subsection reference to strip."""
     m = _SUBSECTION_SUFFIX.match(label.strip())
     return f"{m.group('prefix') or ''}{m.group('article')}" if m else None
@@ -204,9 +174,7 @@ _ARTICLE_LABEL = re.compile(
 )
 
 
-def _sibling_countries(
-    sentence: str, label: str, label_country: Dict[str, str]
-) -> set:
+def _sibling_countries(sentence: str, label: str, label_country: Dict[str, str]) -> set:
     """
     Countries of the OTHER labels cited in the same sentence as `label`,
     used as a proxy for which jurisdiction the sentence is actually
@@ -266,7 +234,9 @@ def _cross_referenced_source_text(
     pattern = re.compile(rf"\bArt(?:icle)?\.?\s*{re.escape(core)}\b", re.IGNORECASE)
 
     label_country = label_country or {}
-    sibling_countries = _sibling_countries(sentence, label, label_country) if sentence else set()
+    sibling_countries = (
+        _sibling_countries(sentence, label, label_country) if sentence else set()
+    )
 
     for other_label, text in chunk_by_label.items():
         if not pattern.search(text):
@@ -330,8 +300,13 @@ def _prioritize_claims(claims: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
 # PER-CITATION CHECK
 # ---------------------------------------------------------------------------
 
+
 def _check_single_citation(
-    sentence: str, label: str, source_text: str, llm_client: OpenAI, full_answer: str = ""
+    sentence: str,
+    label: str,
+    source_text: str,
+    llm_client: OpenAI,
+    full_answer: str = "",
 ) -> Optional[bool]:
     """
     Returns True if the source supports the claim, False if it
@@ -350,12 +325,13 @@ def _check_single_citation(
         context_block = (
             f"FULL ANSWER (context only, to resolve pronouns/references — "
             f"do not judge this as a whole):\n{full_answer}\n\n"
-            if full_answer else ""
+            if full_answer
+            else ""
         )
         # The visible verdict is deliberately limited to YES/NO.
         response = llm_client.chat.completions.create(
             model=CHECK_MODEL,
-            max_tokens=10,
+            max_tokens=output_token_limit(10, gemini=4096),
             temperature=0,
             messages=[
                 {
@@ -415,20 +391,23 @@ def _rewrite_with_grounding_feedback(
     rewrite is safe.
     """
     issue_lines = "\n".join(
-        f'- [{label}] in "{sentence}" — {reason}'
-        for label, sentence, reason in issues
+        f'- [{label}] in "{sentence}" — {reason}' for label, sentence, reason in issues
     )
 
     source_parts: List[str] = []
     chars_used = 0
     issue_labels = [label for label, _, _ in issues]
-    prioritized_labels = list(dict.fromkeys(
-        [
-            base if (base := _base_article_label(label)) in chunk_by_label else label
-            for label in issue_labels
-        ]
-        + list(chunk_by_label)
-    ))
+    prioritized_labels = list(
+        dict.fromkeys(
+            [
+                base
+                if (base := _base_article_label(label)) in chunk_by_label
+                else label
+                for label in issue_labels
+            ]
+            + list(chunk_by_label)
+        )
+    )
     for label in prioritized_labels:
         text = chunk_by_label.get(label)
         if text is None:
@@ -443,24 +422,25 @@ def _rewrite_with_grounding_feedback(
     try:
         response = llm_client.chat.completions.create(
             model=CORRECTION_MODEL,
-            max_tokens=2048,
+            max_tokens=output_token_limit(2048, gemini=8192),
             temperature=0,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "The response below has citation-grounding problems. "
-                    "Rewrite it before it is shown to the user, using only "
-                    "information supported by the supplied sources. Correct "
-                    "or remove unsupported claims and unknown/misattributed "
-                    "citations. Preserve useful supported content and cite "
-                    "sources only with their exact bracketed labels. Do not "
-                    "mention this correction process and do not add a preamble.\n\n"
-                    f"DETECTED PROBLEMS:\n{issue_lines}\n\n"
-                    f"ORIGINAL RESPONSE:\n{answer}\n\n"
-                    "RETRIEVED SOURCES:\n"
-                    + "\n".join(source_parts)
-                ),
-            }],
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "The response below has citation-grounding problems. "
+                        "Rewrite it before it is shown to the user, using only "
+                        "information supported by the supplied sources. Correct "
+                        "or remove unsupported claims and unknown/misattributed "
+                        "citations. Preserve useful supported content and cite "
+                        "sources only with their exact bracketed labels. Do not "
+                        "mention this correction process and do not add a preamble.\n\n"
+                        f"DETECTED PROBLEMS:\n{issue_lines}\n\n"
+                        f"ORIGINAL RESPONSE:\n{answer}\n\n"
+                        "RETRIEVED SOURCES:\n" + "\n".join(source_parts)
+                    ),
+                }
+            ],
         )
         corrected = response.choices[0].message.content.strip()
         return corrected or None
@@ -472,6 +452,7 @@ def _rewrite_with_grounding_feedback(
 # ---------------------------------------------------------------------------
 # GROUNDING CHECK (public entry point — name kept for backward compatibility)
 # ---------------------------------------------------------------------------
+
 
 def check_grounding(
     answer: str,
@@ -534,8 +515,7 @@ def check_grounding(
         logger.warning("Citation extraction failed, returning answer unchecked: %s", e)
         return (
             "[NOTE: the grounding check could not be completed for this "
-            "answer due to a temporary error.]\n\n"
-            + answer
+            "answer due to a temporary error.]\n\n" + answer
         )
 
     if not claims:
@@ -562,9 +542,13 @@ def check_grounding(
     # instead of requiring a full log trace to find it, which is what
     # made diagnosing the last few false positives in this session slower
     # than it needed to be.
-    unknown_label: List[Tuple[str, str]] = []   # cited a label that isn't in chunk_by_label at all
-    unsupported: List[Tuple[str, str]] = []     # label exists, but source doesn't support the claim
-    unverifiable: List[Tuple[str, str]] = []    # check itself failed (transient error)
+    unknown_label: List[
+        Tuple[str, str]
+    ] = []  # cited a label that isn't in chunk_by_label at all
+    unsupported: List[
+        Tuple[str, str]
+    ] = []  # label exists, but source doesn't support the claim
+    unverifiable: List[Tuple[str, str]] = []  # check itself failed (transient error)
 
     # Claims beyond the per-answer cap: not wrong, just never checked —
     # reported separately (below) so that stays visible instead of
@@ -581,7 +565,9 @@ def check_grounding(
                 source_text = chunk_by_label[base_label]
                 logger.debug(
                     "Citation [%s] matched base article [%s] (subsection "
-                    "reference stripped for lookup).", label, base_label,
+                    "reference stripped for lookup).",
+                    label,
+                    base_label,
                 )
 
         if source_text is None:
@@ -591,7 +577,8 @@ def check_grounding(
             if source_text is not None:
                 logger.debug(
                     "Citation [%s] not directly retrieved, but mentioned by "
-                    "another source; verifying the claim against that source.", label
+                    "another source; verifying the claim against that source.",
+                    label,
                 )
             else:
                 unknown_label.append((label, sentence))

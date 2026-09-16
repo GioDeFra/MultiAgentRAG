@@ -20,21 +20,13 @@ import logging
 import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import chromadb
 from chromadb.utils import embedding_functions
-from dotenv import load_dotenv
 
-from llm_client import get_llm_client, model_names
+from llm_client import get_llm_client, model_names, output_token_limit
 
-
-# ---------------------------------------------------------------------------
-# LOAD API KEY
-# ---------------------------------------------------------------------------
-
-load_dotenv(Path(__file__).parent.parent / "Apikey.env")
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +39,14 @@ LEGACY_FACT_COLLECTION = "ltm_facts"
 DEFAULT_MAX_QA_PAIRS = 150
 
 # Hard ceiling only used as a fallback if LLM summarization fails.
-# Never used to cut a sentence in half — see _truncate().
+# Truncate at a word boundary when possible — see _truncate().
 ANSWER_FALLBACK_MAX_CHARS = 2000
 
 
 # ---------------------------------------------------------------------------
 # LONG-TERM MEMORY
 # ---------------------------------------------------------------------------
+
 
 class LongTermMemory:
     """
@@ -119,8 +112,7 @@ class LongTermMemory:
         # One-time cleanup of the facts collection used by older versions.
         # Facts were written but never consumed by the answer pipeline.
         collection_names = {
-            c.name if hasattr(c, "name") else str(c)
-            for c in client.list_collections()
+            c.name if hasattr(c, "name") else str(c) for c in client.list_collections()
         }
         if LEGACY_FACT_COLLECTION in collection_names:
             client.delete_collection(name=LEGACY_FACT_COLLECTION)
@@ -164,8 +156,10 @@ class LongTermMemory:
         # Summarization is a slow network call — do it BEFORE taking the
         # lock so other threads aren't blocked waiting on the LLM API.
         summary = self._summarize(clean_answer, countries_used)
-        stored_answer = summary if summary is not None else self._truncate(
-            clean_answer, ANSWER_FALLBACK_MAX_CHARS
+        stored_answer = (
+            summary
+            if summary is not None
+            else self._truncate(clean_answer, ANSWER_FALLBACK_MAX_CHARS)
         )
         agent_scope = self._agent_scope(agents_used)
 
@@ -186,20 +180,25 @@ class LongTermMemory:
             self._qa_col.upsert(
                 ids=[qa_id],
                 documents=[query],
-                metadatas=[{
-                    "answer": stored_answer,
-                    "answer_is_summary": summary is not None,
-                    "agents_used": json.dumps(agents_used),
-                    "agent_scope": agent_scope,
-                    "countries_used": json.dumps(countries_used),
-                    "country_scope": country_scope,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    **agent_flags,
-                }],
+                metadatas=[
+                    {
+                        "answer": stored_answer,
+                        "answer_is_summary": summary is not None,
+                        "agents_used": json.dumps(agents_used),
+                        "agent_scope": agent_scope,
+                        "countries_used": json.dumps(countries_used),
+                        "country_scope": country_scope,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        **agent_flags,
+                    }
+                ],
             )
 
             if existing_qa_id:
-                logger.info("Updated existing QA record qa_id=%s (near-duplicate question)", qa_id)
+                logger.info(
+                    "Updated existing QA record qa_id=%s (near-duplicate question)",
+                    qa_id,
+                )
             self._enforce_retention_locked(protected_qa_id=qa_id)
 
     @staticmethod
@@ -207,9 +206,7 @@ class LongTermMemory:
         """Stable metadata key representing the exact set of agents used."""
         return "|".join(sorted(set(agents_used)))
 
-    def _find_duplicate_locked(
-        self, query: str, agent_scope: str
-    ) -> Optional[str]:
+    def _find_duplicate_locked(self, query: str, agent_scope: str) -> Optional[str]:
         """
         Return the qa_id of an existing near-identical question, or None.
         Caller must hold self._db_lock.
@@ -297,20 +294,20 @@ class LongTermMemory:
             results["distances"][0],
         ):
             if dist <= self.qa_threshold:
-                hits.append((
-                    doc,
-                    meta["answer"],
-                    dist,
-                    meta.get("country_scope", "not specified"),
-                ))
+                hits.append(
+                    (
+                        doc,
+                        meta["answer"],
+                        dist,
+                        meta.get("country_scope", "not specified"),
+                    )
+                )
 
         return hits
 
     # ── Summary generation ──────────────────────────────────────────────────
 
-    def _summarize(
-        self, answer: str, countries_used: List[str]
-    ) -> Optional[str]:
+    def _summarize(self, answer: str, countries_used: List[str]) -> Optional[str]:
         """
         Ask the LLM for a concise summary of the complete answer, preserving
         figures, fractions, article numbers, and named laws. Returns None on
@@ -320,21 +317,23 @@ class LongTermMemory:
         try:
             response = self._llm.chat.completions.create(
                 model=self._light_model,
-                max_tokens=500,
+                max_tokens=output_token_limit(500, gemini=4096),
                 temperature=0.2,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "Summarize the following legal answer in at most about "
-                        "80 words. Preserve "
-                        "every specific figure, fraction, article number, or named "
-                        "law needed to understand the result. Return only the "
-                        "summary, with no JSON, heading, or preamble. Make the "
-                        "applicable jurisdiction explicit in the summary.\n\n"
-                        f"Jurisdiction(s): {jurisdictions}\n\n"
-                        f"Text:\n{answer}"
-                    ),
-                }],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Summarize the following legal answer in at most about "
+                            "80 words. Preserve "
+                            "every specific figure, fraction, article number, or named "
+                            "law needed to understand the result. Return only the "
+                            "summary, with no JSON, heading, or preamble. Make the "
+                            "applicable jurisdiction explicit in the summary.\n\n"
+                            f"Jurisdiction(s): {jurisdictions}\n\n"
+                            f"Text:\n{answer}"
+                        ),
+                    }
+                ],
             )
             summary = response.choices[0].message.content.strip()
             return summary or None

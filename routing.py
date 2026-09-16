@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 
 from config import AGENT_REGISTRY
+from llm_client import output_token_limit
 
 logger = logging.getLogger(__name__)
 COUNTRY_ALIASES = {
@@ -81,12 +82,16 @@ class RouteDecision:
 
 def country_question(language: str) -> str:
     if language.startswith("it"):
-        return ("A quale Paese o a quali Paesi ti riferisci? Puoi scegliere Italia, Slovenia, "
-                "Estonia, anche due o tutti e tre. Per altri Paesi posso rispondere tramite LLM, "
-                "senza usare le fonti del RAG.")
-    return ("Which country or countries do you mean? You can choose Italy, Slovenia, Estonia, "
-            "two of them or all three. For other countries I can answer using the LLM, "
-            "without RAG sources.")
+        return (
+            "A quale Paese o a quali Paesi ti riferisci? Puoi scegliere Italia, Slovenia, "
+            "Estonia, anche due o tutti e tre. Per altri Paesi posso rispondere tramite LLM, "
+            "senza usare le fonti del RAG."
+        )
+    return (
+        "Which country or countries do you mean? You can choose Italy, Slovenia, Estonia, "
+        "two of them or all three. For other countries I can answer using the LLM, "
+        "without RAG sources."
+    )
 
 
 class JurisdictionRouter:
@@ -94,23 +99,50 @@ class JurisdictionRouter:
         self.client = client
         self.model = model
         self.registry = {spec.agent_id: spec for spec in AGENT_REGISTRY}
-        self.countries = {country for spec in AGENT_REGISTRY for country in spec.countries}
+        self.countries = {
+            country for spec in AGENT_REGISTRY for country in spec.countries
+        }
 
     def route(self, query: str, history: list[dict]) -> RouteDecision:
         user_turns = [turn["query"] for turn in history] + [query]
-        fallback_language = "it" if re.search(r"\b(?:come|quali|paese|paesi|divorzio|eredità|successione|italia)\b", query, re.I) else "en"
+        fallback_language = (
+            "it"
+            if re.search(
+                r"\b(?:come|quali|paese|paesi|divorzio|eredità|successione|italia)\b",
+                query,
+                re.I,
+            )
+            else "en"
+        )
         try:
             response = self.client.chat.completions.create(
-                model=self.model, temperature=0, max_tokens=1800,
+                model=self.model,
+                temperature=0,
+                max_tokens=output_token_limit(1800, gemini=4096),
                 messages=[
                     {"role": "system", "content": ROUTING_PROMPT},
-                    {"role": "user", "content": json.dumps({
-                        "current_question": query,
-                        "user_turns": [{"user_turn": i, "text": text} for i, text in enumerate(user_turns)],
-                        "recent_conversation": history,
-                        "registry": [{"agent_id": s.agent_id, "countries": s.countries,
-                                      "description": s.description} for s in AGENT_REGISTRY],
-                    }, ensure_ascii=False)},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "current_question": query,
+                                "user_turns": [
+                                    {"user_turn": i, "text": text}
+                                    for i, text in enumerate(user_turns)
+                                ],
+                                "recent_conversation": history,
+                                "registry": [
+                                    {
+                                        "agent_id": s.agent_id,
+                                        "countries": s.countries,
+                                        "description": s.description,
+                                    }
+                                    for s in AGENT_REGISTRY
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
                 ],
             )
             raw = response.choices[0].message.content.strip()
@@ -119,27 +151,46 @@ class JurisdictionRouter:
             return self._validate(data, user_turns)
         except Exception as exc:
             # Failure must never broaden a question to every country in the registry.
-            logger.warning("Country routing unavailable (%s); asking for clarification", type(exc).__name__)
-            return RouteDecision(query=query, language=fallback_language,
-                                 direct_answer=country_question(fallback_language), clarification=True)
+            logger.warning(
+                "Country routing unavailable (%s); asking for clarification",
+                type(exc).__name__,
+            )
+            return RouteDecision(
+                query=query,
+                language=fallback_language,
+                direct_answer=country_question(fallback_language),
+                clarification=True,
+            )
 
     def _validate(self, data: dict, user_turns: list[str]) -> RouteDecision:
         if not isinstance(data, dict):
             raise ValueError("Routing response must be an object")
         query, language = data.get("query"), data.get("language")
-        if not isinstance(query, str) or not query.strip() or not isinstance(language, str):
+        if (
+            not isinstance(query, str)
+            or not query.strip()
+            or not isinstance(language, str)
+        ):
             raise ValueError("Missing resolved question or language")
         status = data.get("jurisdiction")
         if status in {"missing", "not_needed"}:
             answer = data.get("direct_answer")
             if not isinstance(answer, str) or not answer.strip():
                 answer = country_question(language)
-            return RouteDecision(query=query, language=language, direct_answer=answer,
-                                 clarification=status == "missing")
+            return RouteDecision(
+                query=query,
+                language=language,
+                direct_answer=answer,
+                clarification=status == "missing",
+            )
         if status != "resolved":
             raise ValueError("Unknown jurisdiction status")
         countries = data.get("countries")
-        if not isinstance(countries, list) or not countries or any(not isinstance(c, str) or not c.strip() for c in countries):
+        if (
+            not isinstance(countries, list)
+            or not countries
+            or any(not isinstance(c, str) or not c.strip() for c in countries)
+        ):
             raise ValueError("Resolved routing needs named countries")
         countries = list(dict.fromkeys(countries))
         evidence = data.get("country_evidence")
@@ -153,16 +204,26 @@ class JurisdictionRouter:
                 index, quote = item.get("user_turn"), item.get("quote")
                 if type(index) is not int or not 0 <= index < len(user_turns):
                     continue
-                if not isinstance(quote, str) or not quote.strip() or quote.casefold() not in user_turns[index].casefold():
+                if (
+                    not isinstance(quote, str)
+                    or not quote.strip()
+                    or quote.casefold() not in user_turns[index].casefold()
+                ):
                     continue
                 # Covered countries cannot be invented from topic keywords or assistant options.
-                if country in COUNTRY_ALIASES and not re.search(COUNTRY_ALIASES[country] + "|" + ALL_COUNTRIES, quote, re.I):
+                if country in COUNTRY_ALIASES and not re.search(
+                    COUNTRY_ALIASES[country] + "|" + ALL_COUNTRIES, quote, re.I
+                ):
                     continue
                 supported = True
                 break
             if not supported:
-                return RouteDecision(query=user_turns[-1], language=language,
-                                     direct_answer=country_question(language), clarification=True)
+                return RouteDecision(
+                    query=user_turns[-1],
+                    language=language,
+                    direct_answer=country_question(language),
+                    clarification=True,
+                )
         agents = data.get("selected_agents")
         if not isinstance(agents, list) or any(not isinstance(a, str) for a in agents):
             raise ValueError("Invalid specialist selection")
@@ -172,30 +233,46 @@ class JurisdictionRouter:
             spec = self.registry.get(aid)
             if spec and set(spec.countries).issubset(covered):
                 selected.append(aid)
-        actual = {country for aid in selected for country in self.registry[aid].countries}
+        actual = {
+            country for aid in selected for country in self.registry[aid].countries
+        }
         if covered != actual:
-            raise ValueError("Specialist selection does not cover exactly the requested countries")
-        return RouteDecision(query=query.strip(), language=language, agent_ids=selected,
-                             external_countries=[c for c in countries if c not in covered])
+            raise ValueError(
+                "Specialist selection does not cover exactly the requested countries"
+            )
+        return RouteDecision(
+            query=query.strip(),
+            language=language,
+            agent_ids=selected,
+            external_countries=[c for c in countries if c not in covered],
+        )
 
     def answer_external(self, route: RouteDecision) -> str:
         """General LLM knowledge is explicitly separate from corpus-grounded answers."""
         countries = ", ".join(route.external_countries)
-        notice = (f"**{countries} — risposta tramite LLM, senza fonti del RAG.**" if route.language.startswith("it")
-                  else f"**{countries} — LLM answer, without RAG sources.**")
+        notice = (
+            f"**{countries} — risposta tramite LLM, senza fonti del RAG.**"
+            if route.language.startswith("it")
+            else f"**{countries} — LLM answer, without RAG sources.**"
+        )
         response = self.client.chat.completions.create(
-            model=self.model, temperature=0.2, max_tokens=2200,
+            model=self.model,
+            temperature=0.2,
+            max_tokens=output_token_limit(2200, gemini=8192),
             messages=[
-                {"role": "system", "content": (
-                    "Answer the question using general model knowledge ONLY for these countries: "
-                    f"{countries}. Respond in language {route.language}. "
-                    "These countries are outside the available document corpus. No retrieval or web "
-                    "search was performed. Do not claim source verification, fabricate citations, "
-                    "or borrow rules from corpus countries. Be clear about uncertainty and do not "
-                    "claim legal rules are current or authoritative when you cannot establish that. "
-                    "Give a useful, focused explanation; distinguish general information from "
-                    "individual legal advice. Do not add a source appendix or answer for other countries."
-                )},
+                {
+                    "role": "system",
+                    "content": (
+                        "Answer the question using general model knowledge ONLY for these countries: "
+                        f"{countries}. Respond in language {route.language}. "
+                        "These countries are outside the available document corpus. No retrieval or web "
+                        "search was performed. Do not claim source verification, fabricate citations, "
+                        "or borrow rules from corpus countries. Be clear about uncertainty and do not "
+                        "claim legal rules are current or authoritative when you cannot establish that. "
+                        "Give a useful, focused explanation; distinguish general information from "
+                        "individual legal advice. Do not add a source appendix or answer for other countries."
+                    ),
+                },
                 {"role": "user", "content": route.query},
             ],
         )

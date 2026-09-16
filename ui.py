@@ -62,6 +62,7 @@ print("System ready.")
 # CHAT HISTORY HELPERS
 # ---------------------------------------------------------------------------
 
+
 def _session_choices():
     """
     (label, value) pairs for the sidebar list, most recently updated first.
@@ -71,8 +72,7 @@ def _session_choices():
     with supervisor_lock:
         sessions = supervisor.history.list_sessions()
     return [
-        (f"{s['title']}  ({s['turn_count']} turns)", s["session_id"])
-        for s in sessions
+        (f"{s['title']}  ({s['turn_count']} turns)", s["session_id"]) for s in sessions
     ]
 
 
@@ -88,6 +88,7 @@ def _turns_to_chatbot(turns_data):
 # ---------------------------------------------------------------------------
 # CHAT LOGIC
 # ---------------------------------------------------------------------------
+
 
 def bot_logic(user_input, history):
 
@@ -127,8 +128,7 @@ def bot_logic(user_input, history):
     except Exception:
         logger.exception("Unable to answer UI request")
         answer = (
-            "A temporary error prevented the request from completing. "
-            "Please try again."
+            "A temporary error prevented the request from completing. Please try again."
         )
 
     # Replace temporary answer
@@ -143,7 +143,6 @@ def bot_logic(user_input, history):
 def handle_submit(user_input, history):
 
     for updated_history in bot_logic(user_input, history):
-
         stm_text = f"{len(supervisor.stm)} turns in session"
         ltm_text = str(supervisor.ltm)
 
@@ -175,8 +174,8 @@ def new_session():
         )
 
     return (
-        [],                 # chatbot history
-        "",                 # textbox
+        [],  # chatbot history
+        "",  # textbox
         "0 turns in session",
         str(supervisor.ltm),
         gr.update(choices=_session_choices(), value=supervisor.session_id),
@@ -215,7 +214,6 @@ def load_selected_session(session_id):
 with gr.Blocks(
     title="Legal RAG",
 ) as demo:
-
     gr.Markdown("# ⚖️ Multi-Agent Legal RAG")
 
     gr.Markdown(
@@ -224,13 +222,11 @@ with gr.Blocks(
     )
 
     with gr.Row():
-
         # ---------------------------------------------------------------
         # Sidebar
         # ---------------------------------------------------------------
 
         with gr.Column(scale=1):
-
             gr.Markdown("### 💬 Chat history")
 
             session_list = gr.Radio(
@@ -262,10 +258,7 @@ with gr.Blocks(
 
             gr.Markdown(
                 "**Agents available:**\n"
-                + "\n".join(
-                    f"- {a.agent_id}"
-                    for a in config.AGENT_REGISTRY
-                )
+                + "\n".join(f"- {a.agent_id}" for a in config.AGENT_REGISTRY)
             )
 
         # ---------------------------------------------------------------
@@ -273,7 +266,6 @@ with gr.Blocks(
         # ---------------------------------------------------------------
 
         with gr.Column(scale=3):
-
             chatbot_options = {
                 "value": [],
                 "label": "Conversation",
@@ -292,7 +284,6 @@ with gr.Blocks(
             )
 
             with gr.Row():
-
                 submit_btn = gr.Button(
                     "Send",
                     variant="primary",
@@ -314,47 +305,22 @@ with gr.Blocks(
         session_list,
     ]
 
-    submit_btn.click(
-        fn=handle_submit,
-        inputs=[msg_input, chatbot],
-        outputs=submit_outputs,
-        concurrency_id="supervisor",
-        concurrency_limit=1,
-    )
+    for event in (submit_btn.click, msg_input.submit):
+        event(
+            fn=handle_submit,
+            inputs=[msg_input, chatbot],
+            outputs=submit_outputs,
+            concurrency_id="supervisor",
+            concurrency_limit=1,
+        )
 
-    msg_input.submit(
-        fn=handle_submit,
-        inputs=[msg_input, chatbot],
-        outputs=submit_outputs,
-        concurrency_id="supervisor",
-        concurrency_limit=1,
-    )
-
-    clear_btn.click(
-        fn=new_session,
-        outputs=[
-            chatbot,
-            msg_input,
-            stm_status,
-            ltm_status,
-            session_list,
-        ],
-        concurrency_id="supervisor",
-        concurrency_limit=1,
-    )
-
-    new_session_btn.click(
-        fn=new_session,
-        outputs=[
-            chatbot,
-            msg_input,
-            stm_status,
-            ltm_status,
-            session_list,
-        ],
-        concurrency_id="supervisor",
-        concurrency_limit=1,
-    )
+    for button in (clear_btn, new_session_btn):
+        button.click(
+            fn=new_session,
+            outputs=submit_outputs,
+            concurrency_id="supervisor",
+            concurrency_limit=1,
+        )
 
     session_list.select(
         fn=load_selected_session,
@@ -376,7 +342,6 @@ with gr.Blocks(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-
     demo.launch(
         # This UI uses one in-process Supervisor/session and is intentionally
         # local-only. A public deployment needs per-user state and auth.

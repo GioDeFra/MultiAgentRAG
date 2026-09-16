@@ -22,7 +22,7 @@ otherwise embeddings run on CPU. Set EMBEDDINGS["device"] to override this.
 
 All scores are per question, using the final response and combined contexts.
 
-Context precision uses the saved order: agent registry order,
+Context precision uses the saved order: selected-agent routing order,
 then each agent's internal ranking. This does not represent global reranking.
 
 """
@@ -56,18 +56,25 @@ EMBEDDINGS = {
 def read_cases(path: Path) -> list[dict]:
     cases = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(cases, list) or not cases:
-        raise ValueError("The JSON file must contain a non-empty list of question/reference objects.")
+        raise ValueError(
+            "The JSON file must contain a non-empty list of question/reference objects."
+        )
     for index, case in enumerate(cases, 1):
         if not isinstance(case, dict) or any(
             not isinstance(case.get(key), str) or not case[key].strip()
             for key in ("question", "reference")
         ):
-            raise ValueError(f"Case {index}: question and reference must be non-empty strings.")
+            raise ValueError(
+                f"Case {index}: question and reference must be non-empty strings."
+            )
     return cases
 
 
 def write_json(path: Path, value) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
 
 
 class NoLongTermMemory:
@@ -84,7 +91,9 @@ def collect(cases: list[dict], output: Path) -> list[dict]:
 
     # Limit the patch to instance construction within this CLI process.
     with patch.object(agents, "LongTermMemory", NoLongTermMemory):
-        supervisor = agents.SupervisorAgent(chat_history_db_path=str(output / "history.db"))
+        supervisor = agents.SupervisorAgent(
+            chat_history_db_path=str(output / "history.db")
+        )
     supervisor._store_in_ltm_background = lambda **kwargs: None
     captured = {}
     for agent_id, agent in supervisor._agents.items():
@@ -101,18 +110,31 @@ def collect(cases: list[dict], output: Path) -> list[dict]:
     for index, case in enumerate(cases, 1):
         supervisor.new_session()
         captured.clear()
-        row = {"id": index, "user_input": case["question"], "reference": case["reference"]}
+        row = {
+            "id": index,
+            "user_input": case["question"],
+            "reference": case["reference"],
+        }
         print(f"\nCollecting case {index}/{len(cases)}")
         try:
             answer = supervisor.ask(case["question"])
             contexts_by_agent = {
-                aid: [f"[{label}] {text}\nSource: {source}" for label, text, _, source in captured[aid].labeled_chunks]
-                for aid in supervisor._agents if aid in captured
+                aid: [
+                    f"[{label}] {text}\nSource: {source}"
+                    for label, text, _, source in captured[aid].labeled_chunks
+                ]
+                for aid in supervisor._agents
+                if aid in captured
             }
-            contexts = [text for chunks in contexts_by_agent.values() for text in chunks]
-            row.update(response=_answer_without_source_appendix(answer),
-                       retrieved_contexts=contexts, contexts_by_agent=contexts_by_agent,
-                       status="collected" if contexts else "no_context")
+            contexts = [
+                text for chunks in contexts_by_agent.values() for text in chunks
+            ]
+            row.update(
+                response=_answer_without_source_appendix(answer),
+                retrieved_contexts=contexts,
+                contexts_by_agent=contexts_by_agent,
+                status="collected" if contexts else "no_context",
+            )
         except Exception as exc:
             row.update(status="generation_error", error=f"{type(exc).__name__}: {exc}")
         rows.append(row)
@@ -133,14 +155,27 @@ def make_judge():
     key_name = EVALUATOR["api_key_env"].strip()
     api_key = os.getenv(key_name)
     if not api_key or not api_key.strip():
-        raise ValueError(f"Missing {key_name}: add it to the environment or Apikey.env.")
+        raise ValueError(
+            f"Missing {key_name}: add it to the environment or Apikey.env."
+        )
 
     from langchain_openai import ChatOpenAI
     from ragas.llms import LangchainLLMWrapper
     from ragas.run_config import RunConfig
-    llm = ChatOpenAI(model=model, api_key=api_key,
-                     base_url=base_url, temperature=0, timeout=180, max_retries=2)
-    return LangchainLLMWrapper(llm, run_config=RunConfig(timeout=180, max_retries=2)), model, base_url
+
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0,
+        timeout=180,
+        max_retries=2,
+    )
+    return (
+        LangchainLLMWrapper(llm, run_config=RunConfig(timeout=180, max_retries=2)),
+        model,
+        base_url,
+    )
 
 
 def make_embeddings():
@@ -160,90 +195,137 @@ def make_embeddings():
     return LangchainEmbeddingsWrapper(embeddings)
 
 
+async def _score_row(row, metrics, context_metrics, SingleTurnSample):
+    """Score one case, retaining skipped metrics and individual errors."""
+    result = {"id": row["id"], "question": row["user_input"], "status": row["status"]}
+    errors = {}
+    if row["status"] == "generation_error":
+        errors["generation"] = row.get("error", "Generation failed")
+    else:
+        sample = SingleTurnSample(
+            user_input=row["user_input"],
+            response=row["response"],
+            reference=row["reference"],
+            retrieved_contexts=row["retrieved_contexts"],
+        )
+        for name, metric in metrics.items():
+            if name in context_metrics and not row["retrieved_contexts"]:
+                result[name] = None
+                continue
+            try:
+                value = float(await metric.single_turn_ascore(sample))
+                if not math.isfinite(value):
+                    raise ValueError("Score is not finite")
+                result[name] = value
+            except Exception as exc:
+                result[name] = None
+                errors[name] = f"{type(exc).__name__}: {exc}"
+            print(f"Case {row['id']}: {name} = {result[name]}", flush=True)
+    result["errors"] = errors
+    return result, errors
+
+
 async def score(rows: list[dict], output: Path) -> None:
     from ragas import SingleTurnSample
     from ragas.metrics import (
-        AnswerCorrectness, AnswerRelevancy, Faithfulness,
-        LLMContextRecall, LLMContextPrecisionWithReference,
+        AnswerCorrectness,
+        AnswerRelevancy,
+        Faithfulness,
+        LLMContextRecall,
+        LLMContextPrecisionWithReference,
     )
     from ragas.run_config import RunConfig
 
     judge, model, base_url = make_judge()
     embeddings = make_embeddings()
-    metrics = {"context_precision": LLMContextPrecisionWithReference(llm=judge),
-               "context_recall": LLMContextRecall(llm=judge),
-               "faithfulness": Faithfulness(llm=judge),
-               "answer_relevancy": AnswerRelevancy(llm=judge, embeddings=embeddings),
-               "answer_correctness": AnswerCorrectness(llm=judge, embeddings=embeddings)}
+    metrics = {
+        "context_precision": LLMContextPrecisionWithReference(llm=judge),
+        "context_recall": LLMContextRecall(llm=judge),
+        "faithfulness": Faithfulness(llm=judge),
+        "answer_relevancy": AnswerRelevancy(llm=judge, embeddings=embeddings),
+        "answer_correctness": AnswerCorrectness(llm=judge, embeddings=embeddings),
+    }
     run_config = RunConfig(timeout=180, max_retries=2)
     for metric in metrics.values():
         metric.init(run_config)
     context_metrics = {"context_precision", "context_recall", "faithfulness"}
     results = []
     for row in rows:
-        result = {"id": row["id"], "question": row["user_input"], "status": row["status"]}
-        errors = {}
-        if row["status"] == "generation_error":
-            errors["generation"] = row.get("error", "Generation failed")
-        else:
-            sample = SingleTurnSample(user_input=row["user_input"], response=row["response"],
-                                      reference=row["reference"], retrieved_contexts=row["retrieved_contexts"])
-            for name, metric in metrics.items():
-                if name in context_metrics and not row["retrieved_contexts"]:
-                    result[name] = None
-                    continue
-                try:
-                    value = float(await metric.single_turn_ascore(sample))
-                    if not math.isfinite(value):
-                        raise ValueError("Score is not finite")
-                    result[name] = value
-                except Exception as exc:
-                    result[name] = None
-                    errors[name] = f"{type(exc).__name__}: {exc}"
-                print(f"Case {row['id']}: {name} = {result[name]}", flush=True)
-        result["errors"] = errors
+        result, errors = await _score_row(
+            row, metrics, context_metrics, SingleTurnSample
+        )
         results.append(result)
         write_json(output / "scores.json", results)
         print(f"Evaluated case {row['id']} ({len(errors)} errors)")
 
     names = list(metrics)
-    summary = {"judge_model": model, "judge_base_url": base_url, "total_cases": len(rows),
-               "embedding_model": EMBEDDINGS["model"], "embedding_provider": EMBEDDINGS["provider"],
-               "answer_correctness_weights": metrics["answer_correctness"].weights,
-               "answer_relevancy_strictness": metrics["answer_relevancy"].strictness,
-               "no_context_cases": sum(r["status"] == "no_context" for r in rows),
-               "generation_errors": sum(r["status"] == "generation_error" for r in rows),
-               "cases_with_errors": sum(bool(r["errors"]) for r in results), "metrics": {}}
+    summary = {
+        "judge_model": model,
+        "judge_base_url": base_url,
+        "total_cases": len(rows),
+        "embedding_model": EMBEDDINGS["model"],
+        "embedding_provider": EMBEDDINGS["provider"],
+        "answer_correctness_weights": metrics["answer_correctness"].weights,
+        "answer_relevancy_strictness": metrics["answer_relevancy"].strictness,
+        "no_context_cases": sum(r["status"] == "no_context" for r in rows),
+        "generation_errors": sum(r["status"] == "generation_error" for r in rows),
+        "cases_with_errors": sum(bool(r["errors"]) for r in results),
+        "metrics": {},
+    }
     for name in names:
         values = [r[name] for r in results if r.get(name) is not None]
-        summary["metrics"][name] = {"mean": sum(values) / len(values) if values else None,
-                                      "valid_cases": len(values)}
+        summary["metrics"][name] = {
+            "mean": sum(values) / len(values) if values else None,
+            "valid_cases": len(values),
+        }
     write_json(output / "summary.json", summary)
     with (output / "scores.csv").open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["id", "question", "status", *names, "errors"], extrasaction="ignore")
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["id", "question", "status", *names, "errors"],
+            extrasaction="ignore",
+        )
         writer.writeheader()
         for result in results:
-            writer.writerow({**result, "errors": json.dumps(result["errors"], ensure_ascii=False)})
+            writer.writerow(
+                {**result, "errors": json.dumps(result["errors"], ensure_ascii=False)}
+            )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--input", type=Path, help="JSON file containing question and reference fields")
+    group.add_argument(
+        "--input", type=Path, help="JSON file containing question and reference fields"
+    )
     group.add_argument("--score-only", type=Path, help="Previously collected dataset")
-    parser.add_argument("--collect-only", action="store_true", help="Collect data only (default behavior)")
-    parser.add_argument("--output", type=Path, help="New results directory (must not already exist)")
+    parser.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="Collect data only (default behavior)",
+    )
+    parser.add_argument(
+        "--output", type=Path, help="New results directory (must not already exist)"
+    )
     args = parser.parse_args()
     if args.score_only and args.collect_only:
         parser.error("--score-only and --collect-only cannot be used together")
     try:
         cases = None if args.score_only else read_cases(args.input)
-        rows = json.loads(args.score_only.read_text(encoding="utf-8")) if args.score_only else None
+        rows = (
+            json.loads(args.score_only.read_text(encoding="utf-8"))
+            if args.score_only
+            else None
+        )
         if rows is not None and (not isinstance(rows, list) or not rows):
             raise ValueError("Empty or invalid dataset")
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
-    output = args.output or Path(__file__).parent / "ragas_results" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output = args.output or Path(
+        __file__
+    ).parent / "ragas_results" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output.mkdir(parents=True, exist_ok=False)
     if rows is None:
         rows = collect(cases, output)

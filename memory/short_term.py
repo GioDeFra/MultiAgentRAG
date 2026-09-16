@@ -61,7 +61,7 @@ class ShortTermMemory:
         the UI from chat history but are not loaded into prompt memory.
         """
         self._turns.clear()
-        self._turns.extend(turns[-self.max_turns:])
+        self._turns.extend(turns[-self.max_turns :])
         self._counter = max((turn.turn_id for turn in turns), default=-1) + 1
 
     def as_context_string(self, n_turns: int = 3) -> str:
@@ -88,7 +88,10 @@ class ShortTermMemory:
         if n_turns < 1:
             raise ValueError("n_turns must be at least 1")
         return [
-            {"query": turn.query, "answer": turn.answer.split("\n\n---\n\n### Sources used", 1)[0]}
+            {
+                "query": turn.query,
+                "answer": turn.answer.split("\n\n---\n\n### Sources used", 1)[0],
+            }
             for turn in list(self._turns)[-n_turns:]
         ]
 

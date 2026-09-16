@@ -69,6 +69,7 @@ def _answer_without_source_appendix(answer: str) -> str:
 # CHAT HISTORY STORE
 # ---------------------------------------------------------------------------
 
+
 class ChatHistoryStore:
     """
     Persistent, chronological store of full chat sessions.
@@ -179,6 +180,22 @@ class ChatHistoryStore:
 
         self._export_json()
 
+    @staticmethod
+    def _export_turn(turn) -> dict:
+        """Format one history turn without source excerpts."""
+        documents = json.loads(turn["retrieved_documents"])
+        return {
+            "turn_id": turn["turn_id"],
+            "timestamp": turn["timestamp"],
+            "user_question": turn["query"],
+            "system_answer": _answer_without_source_appendix(turn["answer"]),
+            "agents_activated": json.loads(turn["agents_activated"]),
+            "retrieved_documents": [
+                {key: value for key, value in document.items() if key != "excerpt"}
+                for document in documents
+            ],
+        }
+
     def _export_json(self) -> None:
         """Write a complete JSON history while excluding source excerpts."""
         try:
@@ -197,33 +214,16 @@ class ChatHistoryStore:
                     ).fetchall()
                     turns = []
                     for turn in turn_rows:
-                        documents = json.loads(turn["retrieved_documents"])
-                        turns.append({
-                            "turn_id": turn["turn_id"],
-                            "timestamp": turn["timestamp"],
-                            "user_question": turn["query"],
-                            "system_answer": _answer_without_source_appendix(
-                                turn["answer"]
-                            ),
-                            "agents_activated": json.loads(
-                                turn["agents_activated"]
-                            ),
-                            "retrieved_documents": [
-                                {
-                                    key: value
-                                    for key, value in document.items()
-                                    if key != "excerpt"
-                                }
-                                for document in documents
-                            ],
-                        })
-                    sessions.append({
-                        "session_id": session["session_id"],
-                        "title": session["title"],
-                        "created_at": session["created_at"],
-                        "updated_at": session["updated_at"],
-                        "turns": turns,
-                    })
+                        turns.append(self._export_turn(turn))
+                    sessions.append(
+                        {
+                            "session_id": session["session_id"],
+                            "title": session["title"],
+                            "created_at": session["created_at"],
+                            "updated_at": session["updated_at"],
+                            "turns": turns,
+                        }
+                    )
 
             destination = Path(self._json_path)
             temporary = destination.with_suffix(".json.tmp")

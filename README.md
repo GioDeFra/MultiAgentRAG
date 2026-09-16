@@ -21,7 +21,7 @@ MultiAgentRAG is a multi-agent retrieval-augmented generation system for answeri
 - Transparent source cards with country, document type, article references, and excerpts
 - Human-readable JSON interaction logging for evaluation and auditing
 - Local Gradio interface with previous-chat navigation
-- Configurable OpenAI-compatible LLM providers: Groq, DeepSeek, Gemini, and z.ai
+- Configurable OpenAI-compatible LLM providers: Groq, DeepSeek, and Gemini
 
 ## How it works
 
@@ -135,7 +135,7 @@ HF_TOKEN=your_hugging_face_token
 LEGAL_RAG_DEBUG=false
 ```
 
-Valid values for `LLM_PROVIDER` are `groq`, `deepseek`, `gemini`, and `zai`. Only the key for the selected provider is required, together with `PINECONE_API_KEY`. Do not commit `Apikey.env`; it is excluded by `.gitignore`.
+Valid values for `LLM_PROVIDER` are `groq`, `deepseek`, and `gemini`. Only the key for the selected provider is required, together with `PINECONE_API_KEY`. Do not commit `Apikey.env`; it is excluded by `.gitignore`.
 
 Provider model assignments are defined centrally in `llm_client.py`. The retrieval embedding model in `agents.py` must remain identical to the model used during ingestion.
 

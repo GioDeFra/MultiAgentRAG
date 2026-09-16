@@ -5,7 +5,7 @@ Provides a single OpenAI-compatible client and the model names used by
 agents, guardrails, and long-term memory. The active provider is selected
 through LLM_PROVIDER in Apikey.env.
 
-Supported providers: Groq, DeepSeek, Gemini, and z.ai.
+Supported providers: Groq, DeepSeek, and Gemini.
 
 Usage:
     from llm_client import get_llm_client, model_names
@@ -13,14 +13,6 @@ Usage:
     client = get_llm_client()
     models = model_names()
 
-    
-Existing LLM_PROVIDER ?
-        ↓
-Supported Provider?
-        ↓
-API Key Available?
-        ↓
-Client Creation
 """
 
 import os
@@ -100,3 +92,6 @@ def model_names() -> dict:
     return _config()["models"]
 
 
+def output_token_limit(default: int, *, gemini: int) -> int:
+    """Allow Gemini room for reasoning as well as visible output."""
+    return gemini if LLM_PROVIDER == "gemini" else default

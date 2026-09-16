@@ -817,8 +817,6 @@ class SupervisorAgent:
         # ── Direct answer path ───────────────────────────────────────────────
         if not agent_ids and direct_answer:
             print("[Supervisor] Answering directly (no retrieval needed).")
-            if not route.clarification:
-                direct_answer += _source_appendix([])
             turn = self.stm.add_turn(
                 query=query,
                 agents_activated=[],
@@ -844,7 +842,7 @@ class SupervisorAgent:
                 "I could not identify a sufficiently specific jurisdiction or "
                 "legal area for retrieval. Please mention the country and whether "
                 "the question concerns divorce or inheritance."
-            ) + _source_appendix([])
+            )
             turn = self.stm.add_turn(query, [], answer)
             self.history.save_turn(self.session_id, turn.turn_id, query, answer, [])
             return answer

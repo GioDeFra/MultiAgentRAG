@@ -75,9 +75,9 @@ _PROVIDERS = {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "api_key_env": "GEMINI_API_KEY",
         "models": {
-            "main": "gemini-3.5-flash",
-            "check": "gemini-3.5-flash",
-            "light": "gemini-3.5-flash",
+            "main": "gemini-3.5-flash-lite",
+            "check": "gemini-3.5-flash-lite",
+            "light": "gemini-3.5-flash-lite",
         },
     },
 }

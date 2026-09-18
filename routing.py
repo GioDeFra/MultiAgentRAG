@@ -115,9 +115,10 @@ class JurisdictionRouter:
             else "en"
         )
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.with_options(max_retries=0).chat.completions.create(
                 model=self.model,
                 temperature=0,
+                timeout=45.0,
                 max_tokens=output_token_limit(1800, gemini=4096),
                 messages=[
                     {"role": "system", "content": ROUTING_PROMPT},
@@ -152,14 +153,19 @@ class JurisdictionRouter:
         except Exception as exc:
             # Failure must never broaden a question to every country in the registry.
             logger.warning(
-                "Country routing unavailable (%s); asking for clarification",
+                "Country routing unavailable (%s)",
                 type(exc).__name__,
             )
             return RouteDecision(
                 query=query,
                 language=fallback_language,
-                direct_answer=country_question(fallback_language),
-                clarification=True,
+                direct_answer=(
+                    "The language-model service has reached a request or quota limit "
+                    "(HTTP 429). Please try again later or check the provider's quota."
+                    if getattr(exc, "status_code", None) == 429
+                    else "The language-model service could not complete routing. "
+                    "Please try again; if the problem persists, check the provider configuration."
+                ),
             )
 
     def _validate(self, data: dict, user_turns: list[str]) -> RouteDecision:

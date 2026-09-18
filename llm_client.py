@@ -23,6 +23,21 @@ from openai import OpenAI
 
 load_dotenv(Path(__file__).parent / "Apikey.env")
 
+
+def configure_tls_certificates():
+    """Repair a stale certificate-file override without disabling TLS checks."""
+    configured = os.environ.get("SSL_CERT_FILE")
+    if configured is not None and not Path(configured).is_file():
+        import certifi
+
+        bundle = Path(certifi.where())
+        if not bundle.is_file():
+            raise RuntimeError("The certifi CA bundle is missing; reinstall certifi")
+        os.environ["SSL_CERT_FILE"] = str(bundle)
+
+
+configure_tls_certificates()
+
 LLM_PROVIDER = os.getenv("LLM_PROVIDER")
 
 if not LLM_PROVIDER:
@@ -62,34 +77,36 @@ _PROVIDERS = {
         "models": {
             "main": "gemini-3.5-flash",
             "check": "gemini-3.5-flash",
-            "light": "gemini-3.1-flash-lite",
+            "light": "gemini-3.5-flash",
         },
     },
 }
 
 
-def _config() -> dict:
-    cfg = _PROVIDERS.get(LLM_PROVIDER)
+def _config(provider: str | None = None) -> dict:
+    selected = (provider or LLM_PROVIDER).strip().lower()
+    cfg = _PROVIDERS.get(selected)
     if cfg is None:
         raise RuntimeError(
-            f"Unknown LLM_PROVIDER={LLM_PROVIDER!r} in Apikey.env — "
+            f"Unknown LLM provider {selected!r} — "
             f"expected one of {list(_PROVIDERS)}"
         )
     return cfg
 
 
-def get_llm_client() -> OpenAI:
-    """OpenAI-compatible client for whichever provider LLM_PROVIDER selects."""
-    cfg = _config()
+def get_llm_client(provider: str | None = None) -> OpenAI:
+    """OpenAI-compatible client for a provider, defaulting to LLM_PROVIDER."""
+    configure_tls_certificates()
+    cfg = _config(provider)
     api_key = os.environ.get(cfg["api_key_env"])
     if not api_key:
         raise RuntimeError(f"Missing {cfg['api_key_env']} — add it to Apikey.env")
     return OpenAI(base_url=cfg["base_url"], api_key=api_key)
 
 
-def model_names() -> dict:
+def model_names(provider: str | None = None) -> dict:
     """{'main': ..., 'check': ..., 'light': ...} for the active provider."""
-    return _config()["models"]
+    return _config(provider)["models"]
 
 
 def output_token_limit(default: int, *, gemini: int) -> int:

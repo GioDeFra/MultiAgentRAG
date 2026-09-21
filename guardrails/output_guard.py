@@ -460,7 +460,8 @@ def check_grounding(
     llm_client: OpenAI = None,
     label_country: Optional[Dict[str, str]] = None,
     _correction_attempted: bool = False,
-) -> str:
+    return_status: bool = False,
+):
     """
     Verify that every "[label]" citation in `answer` is supported by its
     own labelled source text.
@@ -484,21 +485,26 @@ def check_grounding(
         numbered article from an unrelated country's retrieved chunk
         isn't mistaken for corroboration. Safe to omit — falls back to
         the old unscoped behaviour.
+    return_status : bool, optional
+        When true, return the answer and a boolean indicating that at least
+        one citation was checked and every checked citation passed. Answers
+        with no citations or skipped checks are not verified.
 
     Returns
     -------
-    str
-        The original answer if every citation checks out (or if the
-        answer has no citations to check), or the answer with a warning
-        prepended listing exactly which citations failed, could not be
-        verified, or were not checked at all (per-answer check limit).
+    str or tuple[str, bool]
+        The answer, optionally with a verification status. Warnings describe
+        citations that failed, could not be verified, or were not checked.
     """
+    def result(text: str, verified: bool):
+        return (text, verified) if return_status else text
+
     label_country = label_country or {}
     if not chunk_by_label:
-        return (
+        return result((
             "[WARNING: no source documents were retrieved for this answer.]\n\n"
             + answer
-        )
+        ), False)
 
     # Fix known formatting slips (e.g. "[Art. Article 210]" -> "[Art. 210]")
     # before extracting citations, so a malformed-but-fixable label isn't
@@ -513,10 +519,10 @@ def check_grounding(
         claims = _prioritize_claims(_extract_citation_claims(answer))
     except Exception as e:
         logger.warning("Citation extraction failed, returning answer unchecked: %s", e)
-        return (
+        return result((
             "[NOTE: the grounding check could not be completed for this "
             "answer due to a temporary error.]\n\n" + answer
-        )
+        ), False)
 
     if not claims:
         # No bracketed citations found at all — nothing to verify against
@@ -525,11 +531,11 @@ def check_grounding(
         # warning is added; this differs from the "no chunks retrieved"
         # case above, which IS worth flagging.
         if _correction_attempted:
-            return (
+            return result((
                 "[NOTE: the guardrail corrected citation-grounding issues and "
                 "the revised answer passed the second check.]\n\n" + answer
-            )
-        return answer
+            ), False)
+        return result(answer, False)
 
     logger.debug("Extracted citation claims: %s", claims)
 
@@ -609,11 +615,11 @@ def check_grounding(
     # from the warning shown to the user.
     if not (unknown_label or unsupported or unverifiable or skipped_claims):
         if _correction_attempted:
-            return (
+            return result((
                 "[NOTE: the guardrail corrected citation-grounding issues and "
                 "the revised answer passed the second check.]\n\n" + answer
-            )
-        return answer
+            ), True)
+        return result(answer, True)
 
     # Rewrite only for concrete grounding failures. A timeout/unrecognized
     # checker verdict and claims skipped due to the cap do not prove that the
@@ -640,6 +646,7 @@ def check_grounding(
                 llm_client,
                 label_country=label_country,
                 _correction_attempted=True,
+                return_status=return_status,
             )
         correction_failed = True
 
@@ -690,4 +697,4 @@ def check_grounding(
             f"verification limit of {MAX_CITATIONS_TO_CHECK} reached."
         )
 
-    return "\n".join(lines) + "\n\n" + answer
+    return result("\n".join(lines) + "\n\n" + answer, False)

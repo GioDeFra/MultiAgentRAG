@@ -881,12 +881,14 @@ class SupervisorAgent:
 
         # Output guardrail — verifies each citation individually against
         # its own source, not the answer as a whole against everything.
+        citations_verified = False
         try:
-            final_answer = check_grounding(
+            final_answer, citations_verified = check_grounding(
                 final_answer,
                 chunk_by_label,
                 self.llm_client,
                 label_country=label_country,
+                return_status=True,
             )
         except Exception:
             logger.exception("Output guardrail failed unexpectedly")
@@ -937,12 +939,13 @@ class SupervisorAgent:
                 for country in self._agents[aid].description.countries
             }
         )
-        self._store_in_ltm_background(
-            query=resolved_query,
-            answer=final_answer,
-            agents_used=successful_agent_ids,
-            countries_used=countries_used,
-        )
+        if citations_verified and not (failed_agents or no_document_agents):
+            self._store_in_ltm_background(
+                query=resolved_query,
+                answer=final_answer,
+                agents_used=successful_agent_ids,
+                countries_used=countries_used,
+            )
 
         return display_answer
 

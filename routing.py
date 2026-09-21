@@ -23,21 +23,26 @@ ROUTING_PROMPT = """You route questions for a legal assistant. Follow these rule
    in an ASSISTANT answer, suggested options, documents, registry, or clarification is NOT a choice.
    A new unrelated topic without a country needs clarification even if old history names countries.
 2. The user may select one, two or all three countries, explicitly or via an unambiguous follow-up
-   ('both', 'all three'). 'Two countries' without identifying them needs clarification. Resolve
-   negations/exclusions ('Slovenia, not Italy') and overrides ('instead, France') exactly.
-3. After asking for a country, combine a reply such as 'Italy and Slovenia' with the pending
+   referring to earlier user choices. An unspecified subset needs clarification. Resolve
+   negations, exclusions and changes of jurisdiction exactly.
+3. After asking for a country, combine the user's country selection with the pending
    substantive question. Return that full standalone question, never just country names.
 4. Corpus countries: Italy, Slovenia, Estonia. Select ONLY specialists for requested corpus countries.
    For a country outside the corpus, still resolve it in countries using its English name; select no
    agents for that country. A separate LLM answer will handle it. An explicit unsupported country
    is RESOLVED, never missing: do NOT ask confirmation or ask the user to choose a covered country.
    Mixed requests retain all countries and select RAG specialists only for the covered ones.
-   Never substitute a covered country. France is a valid country choice with jurisdiction='resolved'.
-5. All substantive legal questions with a resolved covered country use retrieval. Greetings, thanks
-   and nonlegal conversation use jurisdiction='not_needed' and a brief direct_answer.
+   Never substitute a covered country for an unsupported one.
+5. The corpus covers ONLY divorce and inheritance. Legal questions clearly outside these topics
+   use jurisdiction='out_of_scope', selected_agents=[],
+   countries=[], country_evidence=[], and a useful direct_answer from general model knowledge.
+   Do not fabricate citations or imply retrieval or verification. State uncertainty where appropriate.
+   Divorce and inheritance questions about a covered country use retrieval, including historical questions.
+   Greetings, thanks and nonlegal conversation use jurisdiction='not_needed' and a brief direct_answer.
 6. For jurisdiction='resolved', return country_evidence for EVERY country: a literal quote from an
-   actual USER turn and its user_turn index. Never quote assistant messages. For 'both' you can cite
-   the earlier user turn naming each country; for 'all three' quote that explicit user choice.
+   actual USER turn and its user_turn index. Never quote assistant messages. Resolve collective
+   references from earlier user selections; an explicit selection of all supported countries
+   is valid evidence for each country without requiring individual names in the quote.
 7. Choose specialists by legal area and source type. Use legislation for statutory rules, cases for
    court decisions, both when asked for both. Include each requested corpus country. If the LEGAL
    TOPIC (not country) is unclear for a COVERED country, ask a focused clarification.
@@ -47,26 +52,15 @@ ROUTING_PROMPT = """You route questions for a legal assistant. Follow these rule
 
 Return ONLY JSON with these fields:
 {
-  "jurisdiction": "missing" | "resolved" | "not_needed",
+  "jurisdiction": "missing" | "resolved" | "not_needed" | "out_of_scope",
   "language": "it" | "en" (use the user's language code, other codes allowed),
   "query": "standalone substantive question, with selected countries when resolved",
   "countries": ["English country name"],
-  "country_evidence": [{"country": "Italy", "user_turn": 0, "quote": "Italy"}],
+  "country_evidence": [{"country": "English country name", "user_turn": 0, "quote": "literal user quote"}],
   "selected_agents": ["exact registry id"],
-  "direct_answer": "clarification question when missing, conversational reply when not_needed; otherwise empty"
+  "direct_answer": "clarification question when missing, conversational reply when not_needed; general answer when out_of_scope; otherwise empty"
 }
-For missing/not_needed use countries=[], country_evidence=[], selected_agents=[].
-
-Examples (user_turn indices must match the actual input):
-- 'Come funziona il divorzio in Francia?' => resolved, countries=['France'], agents=[],
-  country_evidence=[{country:'France',user_turn:0,quote:'Francia'}], direct_answer=''.
-- 'Divorzio in Italia e Francia' => resolved, countries=['Italy','France'],
-  selected_agents=['italy_divorce_law']; never ask to confirm France.
-- User turn 0 asks about divorce without country, assistant asks which country, user turn 1
-  says 'Tutti e tre' => resolved, query='Come funziona il divorzio in Italia, Slovenia ed Estonia?',
-  countries=['Italy','Slovenia','Estonia'], select the three divorce legislation agents.
-  For EACH of the three countries country_evidence has user_turn=1, quote='Tutti e tre'.
-  The quote is the collective choice itself, NOT country names absent from that user turn.
+For missing/not_needed/out_of_scope use countries=[], country_evidence=[], selected_agents=[].
 """
 
 
@@ -174,7 +168,7 @@ class JurisdictionRouter:
         query, language = data.get("query"), data.get("language")
         status = data.get("jurisdiction")
         # Direct replies and clarification questions need no rewritten legal query.
-        if status in {"missing", "not_needed"} and (
+        if status in {"missing", "not_needed", "out_of_scope"} and (
             query is None or (isinstance(query, str) and not query.strip())
         ):
             query = user_turns[-1]
@@ -184,10 +178,19 @@ class JurisdictionRouter:
             or not isinstance(language, str)
         ):
             raise ValueError("Missing resolved question or language")
-        if status in {"missing", "not_needed"}:
+        if status in {"missing", "not_needed", "out_of_scope"}:
             answer = data.get("direct_answer")
             if not isinstance(answer, str) or not answer.strip():
+                if status == "out_of_scope":
+                    raise ValueError("Missing out-of-scope answer")
                 answer = country_question(language)
+            if status == "out_of_scope":
+                notice = (
+                    "**Argomento fuori dal corpus: risposta LLM, senza verifica sulle fonti del RAG.**"
+                    if language.startswith("it") else
+                    "**Topic outside the corpus: LLM answer, not verified against RAG sources.**"
+                )
+                answer = f"{notice}\n\n{answer.strip()}"
             return RouteDecision(
                 query=query,
                 language=language,

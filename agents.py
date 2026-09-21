@@ -397,7 +397,7 @@ class SpecializedAgent:
                         f"  Countries   : {', '.join(self.description.countries)}\n"
                         f"  Legal areas : {', '.join(self.description.legal_areas)}\n"
                         f"  Doc types   : {', '.join(self.description.content_types)}\n\n"
-                        "Answer using ONLY the provided context documents.\n"
+                        "Answer in the same language as the user's question, using ONLY the provided context documents.\n"
                         "Answer ONLY for the countries listed in your specialist coverage. "
                         "If the question also names other countries, leave those parts to "
                         "the other answer paths; do not infer their rules.\n"
@@ -663,7 +663,7 @@ class SupervisorAgent:
         if is_comparative:
             system_content = (
                 "You are a senior comparative law expert.\n"
-                "Synthesise the partial answers below into one clear, "
+                "Use the language of the user's question. Synthesise the partial answers below into one clear, "
                 "well-structured response.\n"
                 "Highlight similarities and differences between jurisdictions.\n"
                 "Preserve all document references exactly as they appear in "
@@ -675,7 +675,7 @@ class SupervisorAgent:
         else:
             system_content = (
                 "You are a senior legal expert.\n"
-                "The partial answers below all concern the SAME single "
+                "Use the language of the user's question. The partial answers below all concern the SAME single "
                 "jurisdiction (case law and legislation, retrieved and "
                 "answered separately) — synthesise them into one clear, "
                 "coherent response about that one jurisdiction only.\n"

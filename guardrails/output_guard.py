@@ -429,7 +429,7 @@ def _rewrite_with_grounding_feedback(
                     "role": "user",
                     "content": (
                         "The response below has citation-grounding problems. "
-                        "Rewrite it before it is shown to the user, using only "
+                        "Rewrite it in the original answer's language before it is shown to the user, using only "
                         "information supported by the supplied sources. Correct "
                         "or remove unsupported claims and unknown/misattributed "
                         "citations. Preserve useful supported content and cite "
